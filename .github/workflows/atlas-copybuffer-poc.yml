@@ -40,12 +40,15 @@ jobs:
             atlas/atlas-postgres/src/test/scala/com/netflix/atlas/postgres/CopyBufferSecurityRegressionSuite.scala
           cp poc/SqlLiteralModeRegressionSuite.scala \
             atlas/atlas-postgres/src/test/scala/com/netflix/atlas/postgres/SqlLiteralModeRegressionSuite.scala
+          cp poc/BinaryCopyBufferUnicodeRegressionSuite.scala \
+            atlas/atlas-postgres/src/test/scala/com/netflix/atlas/postgres/BinaryCopyBufferUnicodeRegressionSuite.scala
 
       - name: Run actual Atlas implementations against PostgreSQL
         env:
           ATLAS_COMMIT: be85494f3f4b910f91890b69bf47f0ee25662829
           ATLAS_COPY_RESULT: ${{ github.workspace }}/evidence/atlas-copybuffer-result.json
           ATLAS_LITERAL_RESULT: ${{ github.workspace }}/evidence/atlas-sql-literal-mode-result.json
+          ATLAS_UNICODE_RESULT: ${{ github.workspace }}/evidence/atlas-binary-unicode-result.json
         run: |
           set -euo pipefail
           cd atlas
@@ -53,6 +56,7 @@ jobs:
           cat /dev/null | project/sbt ++2.13.18 \
             'atlas-postgres/testOnly com.netflix.atlas.postgres.CopyBufferSecurityRegressionSuite' \
             'atlas-postgres/testOnly com.netflix.atlas.postgres.SqlLiteralModeRegressionSuite' \
+            'atlas-postgres/testOnly com.netflix.atlas.postgres.BinaryCopyBufferUnicodeRegressionSuite' \
             2>&1 | tee "$GITHUB_WORKSPACE/evidence/sbt-test.log"
 
       - name: Audit exact-source reachability and module wiring
@@ -129,9 +133,11 @@ jobs:
             atlas/atlas-postgres/src/main/scala/com/netflix/atlas/postgres/SqlUtils.scala \
             poc/CopyBufferSecurityRegressionSuite.scala \
             poc/SqlLiteralModeRegressionSuite.scala \
+            poc/BinaryCopyBufferUnicodeRegressionSuite.scala \
             > evidence/sha256.txt
           cp poc/CopyBufferSecurityRegressionSuite.scala evidence/
           cp poc/SqlLiteralModeRegressionSuite.scala evidence/
+          cp poc/BinaryCopyBufferUnicodeRegressionSuite.scala evidence/
 
       - name: Verify machine-readable PASS results
         if: always()
@@ -139,11 +145,15 @@ jobs:
           set -euo pipefail
           test -f evidence/atlas-copybuffer-result.json
           test -f evidence/atlas-sql-literal-mode-result.json
+          test -f evidence/atlas-binary-unicode-result.json
           test "$(jq -r .verdict evidence/atlas-copybuffer-result.json)" = "PASS"
           test "$(jq -r .verdict evidence/atlas-sql-literal-mode-result.json)" = "PASS"
+          test "$(jq -r .verdict evidence/atlas-binary-unicode-result.json)" = "PASS"
           test "$(jq -r .atlas_commit evidence/atlas-copybuffer-result.json)" = \
             "be85494f3f4b910f91890b69bf47f0ee25662829"
           test "$(jq -r .atlas_commit evidence/atlas-sql-literal-mode-result.json)" = \
+            "be85494f3f4b910f91890b69bf47f0ee25662829"
+          test "$(jq -r .atlas_commit evidence/atlas-binary-unicode-result.json)" = \
             "be85494f3f4b910f91890b69bf47f0ee25662829"
 
       - name: Upload evidence bundle
