@@ -1,4 +1,4 @@
-name: Atlas PostgreSQL CopyBuffer PoC
+name: Atlas PostgreSQL Agent 7 Validation
 
 on:
   pull_request:
@@ -32,24 +32,84 @@ jobs:
           distribution: zulu
           cache: sbt
 
-      - name: Install source-level regression test
+      - name: Install source-level regression tests
         run: |
           set -euo pipefail
           mkdir -p evidence
           cp poc/CopyBufferSecurityRegressionSuite.scala \
             atlas/atlas-postgres/src/test/scala/com/netflix/atlas/postgres/CopyBufferSecurityRegressionSuite.scala
+          cp poc/SqlLiteralModeRegressionSuite.scala \
+            atlas/atlas-postgres/src/test/scala/com/netflix/atlas/postgres/SqlLiteralModeRegressionSuite.scala
 
-      - name: Run actual Atlas CopyBuffer implementations against PostgreSQL
+      - name: Run actual Atlas implementations against PostgreSQL
         env:
           ATLAS_COMMIT: be85494f3f4b910f91890b69bf47f0ee25662829
           ATLAS_COPY_RESULT: ${{ github.workspace }}/evidence/atlas-copybuffer-result.json
+          ATLAS_LITERAL_RESULT: ${{ github.workspace }}/evidence/atlas-sql-literal-mode-result.json
         run: |
           set -euo pipefail
           cd atlas
           chmod +x project/sbt
           cat /dev/null | project/sbt ++2.13.18 \
             'atlas-postgres/testOnly com.netflix.atlas.postgres.CopyBufferSecurityRegressionSuite' \
+            'atlas-postgres/testOnly com.netflix.atlas.postgres.SqlLiteralModeRegressionSuite' \
             2>&1 | tee "$GITHUB_WORKSPACE/evidence/sbt-test.log"
+
+      - name: Audit exact-source reachability and module wiring
+        if: always()
+        run: |
+          set -euo pipefail
+          pattern='TextCopyBuffer|BinaryCopyBuffer|CopyBuffer|putTagsJson|putTagsJsonb|putTagsHstore|putTagsText|getCopyManager|copyIn\('
+
+          git -C atlas grep -n -E "$pattern" -- . \
+            > evidence/all-copybuffer-references.txt || true
+
+          git -C atlas grep -n -E "$pattern" -- . \
+            | grep -v '^atlas-postgres/src/test/' \
+            > evidence/non-test-copybuffer-references.txt || true
+
+          git -C atlas grep -n -E 'new (TextCopyBuffer|BinaryCopyBuffer)|[.]putTags(Json|Jsonb|Hstore|Text)\(|[.]copyIn\(' -- . \
+            | grep -v '^atlas-postgres/src/test/' \
+            | grep -v '^atlas-postgres/src/main/scala/com/netflix/atlas/postgres/CopyBuffer.scala:' \
+            | grep -v '^atlas-postgres/src/main/scala/com/netflix/atlas/postgres/TextCopyBuffer.scala:' \
+            | grep -v '^atlas-postgres/src/main/scala/com/netflix/atlas/postgres/BinaryCopyBuffer.scala:' \
+            > evidence/non-test-copybuffer-consumers.txt || true
+
+          git -C atlas grep -n -E 'new PostgresDatabase|PostgresDatabase\(|new PostgresService|PostgresService\(' -- . \
+            | grep -v '^atlas-postgres/src/test/' \
+            | grep -v '^atlas-postgres/src/main/scala/com/netflix/atlas/postgres/PostgresDatabase.scala:' \
+            | grep -v '^atlas-postgres/src/main/scala/com/netflix/atlas/postgres/PostgresService.scala:' \
+            > evidence/non-test-postgres-database-consumers.txt || true
+
+          git -C atlas grep -n 'com.netflix.atlas.postgres' -- . \
+            | grep -v '^atlas-postgres/' \
+            > evidence/cross-module-postgres-imports.txt || true
+
+          {
+            echo '=== every build.sbt reference to atlas-postgres ==='
+            grep -n 'atlas-postgres' atlas/build.sbt || true
+            echo
+            echo '=== atlas-postgres project block ==='
+            grep -n -A12 -B2 'lazy val `atlas-postgres`' atlas/build.sbt || true
+            echo
+            echo '=== atlas-standalone project block ==='
+            grep -n -A18 -B2 'lazy val `atlas-standalone`' atlas/build.sbt || true
+          } > evidence/module-wiring.txt
+
+          {
+            echo "exact_commit=$(git -C atlas rev-parse HEAD)"
+            echo "all_reference_lines=$(wc -l < evidence/all-copybuffer-references.txt)"
+            echo "non_test_reference_lines=$(wc -l < evidence/non-test-copybuffer-references.txt)"
+            echo "non_test_copybuffer_consumer_lines=$(wc -l < evidence/non-test-copybuffer-consumers.txt)"
+            echo "non_test_postgres_database_consumer_lines=$(wc -l < evidence/non-test-postgres-database-consumers.txt)"
+            echo "cross_module_postgres_import_lines=$(wc -l < evidence/cross-module-postgres-imports.txt)"
+          } > evidence/reachability-counts.txt
+
+          git -C atlas ls-files > evidence/tracked-files.txt
+          sed -n '1,180p' \
+            atlas/atlas-postgres/src/main/scala/com/netflix/atlas/postgres/PostgresDatabase.scala \
+            > evidence/PostgresDatabase.scala.txt
+          cp atlas/build.sbt evidence/build.sbt.txt
 
       - name: Collect immutable evidence metadata
         if: always()
@@ -66,24 +126,31 @@ jobs:
             atlas/atlas-postgres/src/main/scala/com/netflix/atlas/postgres/TextCopyBuffer.scala \
             atlas/atlas-postgres/src/main/scala/com/netflix/atlas/postgres/BinaryCopyBuffer.scala \
             atlas/atlas-postgres/src/main/scala/com/netflix/atlas/postgres/CopyBuffer.scala \
+            atlas/atlas-postgres/src/main/scala/com/netflix/atlas/postgres/SqlUtils.scala \
             poc/CopyBufferSecurityRegressionSuite.scala \
+            poc/SqlLiteralModeRegressionSuite.scala \
             > evidence/sha256.txt
           cp poc/CopyBufferSecurityRegressionSuite.scala evidence/
+          cp poc/SqlLiteralModeRegressionSuite.scala evidence/
 
-      - name: Verify machine-readable PASS result
+      - name: Verify machine-readable PASS results
         if: always()
         run: |
           set -euo pipefail
           test -f evidence/atlas-copybuffer-result.json
+          test -f evidence/atlas-sql-literal-mode-result.json
           test "$(jq -r .verdict evidence/atlas-copybuffer-result.json)" = "PASS"
+          test "$(jq -r .verdict evidence/atlas-sql-literal-mode-result.json)" = "PASS"
           test "$(jq -r .atlas_commit evidence/atlas-copybuffer-result.json)" = \
+            "be85494f3f4b910f91890b69bf47f0ee25662829"
+          test "$(jq -r .atlas_commit evidence/atlas-sql-literal-mode-result.json)" = \
             "be85494f3f4b910f91890b69bf47f0ee25662829"
 
       - name: Upload evidence bundle
         if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: atlas-copybuffer-poc-evidence
+          name: atlas-postgres-agent7-evidence
           path: evidence/
           if-no-files-found: error
           retention-days: 30
