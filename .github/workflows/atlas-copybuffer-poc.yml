@@ -1,0 +1,89 @@
+name: Atlas PostgreSQL CopyBuffer PoC
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Exact Atlas source against embedded PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout validation harness
+        uses: actions/checkout@v7
+
+      - name: Checkout exact Netflix Atlas commit
+        uses: actions/checkout@v7
+        with:
+          repository: Netflix/atlas
+          ref: be85494f3f4b910f91890b69bf47f0ee25662829
+          path: atlas
+          persist-credentials: false
+
+      - name: Set up JDK 17 and sbt cache
+        uses: actions/setup-java@v5.6.0
+        with:
+          java-version: '17'
+          distribution: zulu
+          cache: sbt
+
+      - name: Install source-level regression test
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cp poc/CopyBufferSecurityRegressionSuite.scala \
+            atlas/atlas-postgres/src/test/scala/com/netflix/atlas/postgres/CopyBufferSecurityRegressionSuite.scala
+
+      - name: Run actual Atlas CopyBuffer implementations against PostgreSQL
+        env:
+          ATLAS_COMMIT: be85494f3f4b910f91890b69bf47f0ee25662829
+          ATLAS_COPY_RESULT: ${{ github.workspace }}/evidence/atlas-copybuffer-result.json
+        run: |
+          set -euo pipefail
+          cd atlas
+          chmod +x project/sbt
+          cat /dev/null | project/sbt ++2.13.18 \
+            'atlas-postgres/testOnly com.netflix.atlas.postgres.CopyBufferSecurityRegressionSuite' \
+            2>&1 | tee "$GITHUB_WORKSPACE/evidence/sbt-test.log"
+
+      - name: Collect immutable evidence metadata
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "atlas_commit=$(git -C atlas rev-parse HEAD)"
+            echo "validation_commit=$GITHUB_SHA"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            java -version 2>&1
+          } > evidence/metadata.txt
+          sha256sum \
+            atlas/atlas-postgres/src/main/scala/com/netflix/atlas/postgres/TextCopyBuffer.scala \
+            atlas/atlas-postgres/src/main/scala/com/netflix/atlas/postgres/BinaryCopyBuffer.scala \
+            atlas/atlas-postgres/src/main/scala/com/netflix/atlas/postgres/CopyBuffer.scala \
+            poc/CopyBufferSecurityRegressionSuite.scala \
+            > evidence/sha256.txt
+          cp poc/CopyBufferSecurityRegressionSuite.scala evidence/
+
+      - name: Verify machine-readable PASS result
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f evidence/atlas-copybuffer-result.json
+          test "$(jq -r .verdict evidence/atlas-copybuffer-result.json)" = "PASS"
+          test "$(jq -r .atlas_commit evidence/atlas-copybuffer-result.json)" = \
+            "be85494f3f4b910f91890b69bf47f0ee25662829"
+
+      - name: Upload evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: atlas-copybuffer-poc-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
