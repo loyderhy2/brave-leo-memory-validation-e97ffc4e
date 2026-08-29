@@ -72,13 +72,20 @@ class BinaryCopyBufferUnicodeRegressionSuite extends FunSuite {
         case '\n' => b.append("\\n")
         case '\r' => b.append("\\r")
         case '\t' => b.append("\\t")
-        case _ if Character.isSurrogate(c) => b.append(f"\\u${c.toInt}%04x")
+        // A lone surrogate is not a legal JSON Unicode scalar. Encode it as a
+        // literal debug sequence (two JSON backslashes), while the UTF-16 unit
+        // array below records the exact Java String contents machine-readably.
+        case _ if Character.isSurrogate(c) => b.append(f"\\\\u${c.toInt}%04x")
         case _ if c < ' '                  => b.append(f"\\u${c.toInt}%04x")
         case _                             => b.append(c)
       }
       i += 1
     }
     b.append('"').toString
+  }
+
+  private def utf16Units(s: String): String = {
+    s.toCharArray.iterator.map(c => f"\"${c.toInt}%04x\"").mkString("[", ",", "]")
   }
 
   test("BinaryCopyBuffer must not silently truncate malformed Unicode") {
@@ -121,7 +128,8 @@ class BinaryCopyBufferUnicodeRegressionSuite extends FunSuite {
       s"""{
          |  "verdict": "PASS",
          |  "atlas_commit": ${jsonQuote(atlasCommit)},
-         |  "attacker_input": ${jsonQuote(malformed)},
+         |  "attacker_input_debug": ${jsonQuote(malformed)},
+         |  "attacker_input_utf16_units": ${utf16Units(malformed)},
          |  "input_equals_admin": false,
          |  "strict_utf8_encoder_result": ${jsonQuote(strictEncoderResult.toString)},
          |  "stored_text": ${jsonQuote(storedText)},
