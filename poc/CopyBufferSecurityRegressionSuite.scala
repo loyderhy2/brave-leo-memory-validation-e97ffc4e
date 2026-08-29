@@ -19,7 +19,6 @@ import java.nio.file.Paths
 import java.sql.Connection
 import java.sql.DriverManager
 import java.sql.ResultSet
-import java.sql.Statement
 import scala.util.Using
 
 class CopyBufferSecurityRegressionSuite extends FunSuite {
