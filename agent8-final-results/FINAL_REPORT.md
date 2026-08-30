@@ -1,6 +1,6 @@
 # AGENT 8 — FINAL RESEARCH REPORT
 
-Generated: `2026-08-30T11:18:17.853561+00:00`
+Generated: `2026-08-30T11:19:43.523660+00:00`
 Current shipped binary: `1.1.3`
 Recommended HackerOne asset: **MongoDB Connectors (recommended product-family mapping; verify exact H1 selector label)**
 
