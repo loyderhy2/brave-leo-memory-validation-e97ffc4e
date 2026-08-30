@@ -1,0 +1,144 @@
+name: Agent 8 MongoSQL TRR validation
+
+on:
+  push:
+    branches:
+      - agent8-mongosql-trr-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  validate-trr:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out validation branch
+        uses: actions/checkout@v4
+
+      - name: Download and identify current MongoSQL Transition Readiness Tool
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence/bin evidence/run/sandbox/out
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-linux \
+            --output evidence/bin/AtlasSQLReadinessReport-linux
+          chmod +x evidence/bin/AtlasSQLReadinessReport-linux
+          sha256sum evidence/bin/AtlasSQLReadinessReport-linux | tee evidence/bin/sha256.txt
+          file evidence/bin/AtlasSQLReadinessReport-linux | tee evidence/bin/file.txt
+          (ldd evidence/bin/AtlasSQLReadinessReport-linux || true) | tee evidence/bin/ldd.txt
+          (evidence/bin/AtlasSQLReadinessReport-linux --version || true) 2>&1 | tee evidence/bin/version.txt
+          (evidence/bin/AtlasSQLReadinessReport-linux --help || true) 2>&1 | tee evidence/bin/help.txt
+          strings -a evidence/bin/AtlasSQLReadinessReport-linux > evidence/bin/strings.txt
+
+      - name: Start local MongoDB and seed adversarial metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker run --detach --name agent8-mongo \
+            --publish 127.0.0.1:27017:27017 \
+            --env MONGO_INITDB_ROOT_USERNAME=trruser \
+            --env MONGO_INITDB_ROOT_PASSWORD=TRR_SECRET_CANARY_7A91FD \
+            mongo:8.0
+
+          for attempt in $(seq 1 60); do
+            if docker exec agent8-mongo mongosh --quiet \
+              --username trruser --password TRR_SECRET_CANARY_7A91FD \
+              --authenticationDatabase admin \
+              --eval 'db.adminCommand({ ping: 1 })' >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          cat > evidence/run/seed.js <<'JAVASCRIPT'
+          const target = db.getSiblingDB("trrtest");
+          const collections = [
+            "normal",
+            "../TRR_PATH_MARKER_PARENT",
+            "../../TRR_PATH_MARKER_GRANDPARENT",
+            "nested/TRR_PATH_MARKER_CHILD",
+            "quote\"attr-marker",
+            "single'quote-marker",
+            "<b id=TRR_HTML_COLLECTION_MARKER>collection</b>",
+            "=HYPERLINK(\"http://127.0.0.1:8765/TRR_CSV_COLLECTION_MARKER\",\"open\")",
+            "+SUM(1,1)",
+            "-1+1",
+            "@SUM(1,1)"
+          ];
+
+          for (const name of collections) {
+            try {
+              target.createCollection(name);
+              target.getCollection(name).insertOne({
+                normal: 1,
+                "../TRR_FIELD_PATH_MARKER": "path",
+                "quote\"attr-field": "attribute",
+                "single'quote-field": "attribute",
+                "<i id=TRR_HTML_FIELD_MARKER>field</i>": "html",
+                "=HYPERLINK(\"http://127.0.0.1:8765/TRR_CSV_FIELD_MARKER\",\"open\")": "formula",
+                "+SUM(2,2)": "plus",
+                "-2+2": "minus",
+                "@SUM(2,2)": "at"
+              });
+              print(`CREATED:${name}`);
+            } catch (e) {
+              print(`FAILED:${name}:${e}`);
+            }
+          }
+
+          printjson(target.getCollectionNames());
+          JAVASCRIPT
+
+          docker exec -i agent8-mongo mongosh --quiet \
+            --username trruser --password TRR_SECRET_CANARY_7A91FD \
+            --authenticationDatabase admin \
+            < evidence/run/seed.js 2>&1 | tee evidence/run/seed.log
+
+      - name: Generate current reports inside a guarded output directory
+        shell: bash
+        run: |
+          set -u
+          cd evidence/run/sandbox
+          printf 'GUARD_PARENT\n' > TRR_PARENT_GUARD.txt
+          printf 'GUARD_OUTPUT\n' > out/TRR_OUTPUT_GUARD.txt
+          find .. -mindepth 1 -printf 'BEFORE %y %p\n' | sort > ../tree-before.txt
+
+          set +e
+          ../../bin/AtlasSQLReadinessReport-linux \
+            --uri 'mongodb://trruser:TRR_SECRET_CANARY_7A91FD@127.0.0.1:27017/admin?authSource=admin' \
+            --output "$PWD/out" \
+            --include 'trrtest.*' \
+            > ../stdout.txt 2> ../stderr.txt
+          status=$?
+          set -e
+          printf '%s\n' "$status" > ../exit-status.txt
+
+          find .. -mindepth 1 -printf 'AFTER %y %m %s %p -> %l\n' | sort > ../tree-after.txt
+          find "$PWD/out" -mindepth 1 -maxdepth 10 -printf '%y %m %s %p -> %l\n' | sort > ../output-tree.txt
+          grep -RIna --binary-files=without-match \
+            -e 'TRR_' -e 'HYPERLINK' -e '<b' -e '<i' -e 'href=' -e 'src=' \
+            "$PWD/out" > ../marker-grep.txt || true
+          grep -RIna --binary-files=without-match 'TRR_SECRET_CANARY_7A91FD' .. > ../secret-grep.txt || true
+          diff -u ../tree-before.txt ../tree-after.txt > ../tree.diff || true
+
+      - name: Preserve container logs and package evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          docker logs agent8-mongo > evidence/run/mongodb.stdout.txt 2> evidence/run/mongodb.stderr.txt
+          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-mongosql-trr-evidence.tar.gz evidence
+          sha256sum agent8-mongosql-trr-evidence.tar.gz > agent8-mongosql-trr-evidence.tar.gz.sha256
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent8-mongosql-trr-evidence
+          path: |
+            agent8-mongosql-trr-evidence.tar.gz
+            agent8-mongosql-trr-evidence.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
