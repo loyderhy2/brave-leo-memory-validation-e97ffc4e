@@ -1,0 +1,245 @@
+name: Agent 8 MongoSQL final qualification
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent8-mongosql-final-20260830
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch prior independent black-box results
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p final-run/results
+          base="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}"
+          curl --fail --location --retry 8 --retry-all-errors \
+            "$base/agent8-mongosql-trr-secondwave-20260830/agent8-results/latest.json" \
+            -o final-run/secondwave.json
+          curl --fail --location --retry 8 --retry-all-errors \
+            "$base/agent8-mongosql-trr-thirdwave-20260830/agent8-thirdwave-results/latest.json" \
+            -o final-run/thirdwave.json
+          python3 -m json.tool final-run/secondwave.json >/dev/null
+          python3 -m json.tool final-run/thirdwave.json >/dev/null
+
+      - name: Run public duplicate and scope scan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 agent8-final/public_scan.py
+
+      - name: Select any current CSV bypass for independent impact validation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 agent8-final/prepare_impact.py
+          cat final-run/impact-meta.json
+
+      - name: Install impact-validation tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if python3 -c 'import json,sys; sys.exit(0 if json.load(open("final-run/impact-meta.json"))["skipped"] else 1)'; then
+            echo "No third-wave CSV bypass crossed the selection gate; skipping LibreOffice impact rerun."
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y libreoffice-calc
+          python3 -m pip install --break-system-packages openpyxl
+          libreoffice --version | tee final-run/results/libreoffice-version.txt
+
+      - name: Download current shipped tool and start local services
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if python3 -c 'import json,sys; sys.exit(0 if json.load(open("final-run/impact-meta.json"))["skipped"] else 1)'; then
+            exit 0
+          fi
+          mkdir -p final-run/bin final-run/impact-out final-run/impact-converted final-run/control-converted
+          curl --fail --location --retry 8 --retry-all-errors \
+            https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-linux \
+            -o final-run/bin/AtlasSQLReadinessReport-linux
+          chmod +x final-run/bin/AtlasSQLReadinessReport-linux
+          sha256sum final-run/bin/AtlasSQLReadinessReport-linux > final-run/results/current-binary-sha256.txt
+          final-run/bin/AtlasSQLReadinessReport-linux --version > final-run/results/current-binary-version.txt 2>&1 || true
+
+          docker run -d --name agent8-final-mongo \
+            -p 127.0.0.1:27017:27017 \
+            -e MONGO_INITDB_ROOT_USERNAME=impactuser \
+            -e MONGO_INITDB_ROOT_PASSWORD='IMPACT_SECRET_CANARY_91C4' \
+            mongo:8.0
+          ready=0
+          for i in $(seq 1 90); do
+            if docker exec agent8-final-mongo mongosh --quiet \
+              -u impactuser -p 'IMPACT_SECRET_CANARY_91C4' \
+              --authenticationDatabase admin \
+              --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = 1
+
+          cat > final-run/callback.py <<'PY'
+          from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+          from pathlib import Path
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  with Path('final-run/results/impact-callbacks.log').open('a') as out:
+                      out.write(self.path + '\n')
+                  self.send_response(204)
+                  self.end_headers()
+              def log_message(self, *args):
+                  pass
+          ThreadingHTTPServer(('127.0.0.1', 8765), Handler).serve_forever()
+          PY
+          : > final-run/results/impact-callbacks.log
+          python3 final-run/callback.py > final-run/results/callback-server.txt 2>&1 &
+          echo $! > final-run/results/callback-server.pid
+
+      - name: Seed and generate independent current-version report
+        shell: bash
+        run: |
+          set -u
+          if python3 -c 'import json,sys; sys.exit(0 if json.load(open("final-run/impact-meta.json"))["skipped"] else 1)'; then
+            exit 0
+          fi
+          set -e
+          docker exec -i agent8-final-mongo mongosh --quiet \
+            -u impactuser -p 'IMPACT_SECRET_CANARY_91C4' \
+            --authenticationDatabase admin \
+            < final-run/impact-seed.js \
+            > final-run/results/impact-seed.log 2>&1
+
+          set +e
+          timeout -k 10s 240s final-run/bin/AtlasSQLReadinessReport-linux \
+            --uri 'mongodb://impactuser:IMPACT_SECRET_CANARY_91C4@127.0.0.1:27017/admin?authSource=admin' \
+            --output "$PWD/final-run/impact-out" \
+            --include 'trrimpact.safe' \
+            </dev/null > final-run/results/impact-run.stdout 2> final-run/results/impact-run.stderr
+          echo $? > final-run/results/impact-run.exit
+          set -e
+          find final-run/impact-out -type f -printf '%P\n' | sort > final-run/results/impact-output-files.txt
+
+      - name: Exercise real LibreOffice CSV import and recalculation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if python3 -c 'import json,sys; sys.exit(0 if json.load(open("final-run/impact-meta.json"))["skipped"] else 1)'; then
+            exit 0
+          fi
+
+          profile="$(mktemp -d)"
+          timeout -k 10s 120s libreoffice \
+            -env:UserInstallation="file://$profile" --headless \
+            --convert-to xlsx --outdir final-run/control-converted \
+            final-run/control/control.csv \
+            > final-run/results/control-import.stdout \
+            2> final-run/results/control-import.stderr || true
+          rm -rf "$profile"
+
+          index=0
+          while IFS= read -r -d '' source; do
+            index=$((index + 1))
+            staging="final-run/csv-$index"
+            destination="final-run/impact-converted/import-$index"
+            mkdir -p "$staging" "$destination"
+            cp "$source" "$staging/input.csv"
+            printf '%s\n' "$source" > "$destination/source-path.txt"
+            profile="$(mktemp -d)"
+            timeout -k 10s 120s libreoffice \
+              -env:UserInstallation="file://$profile" --headless \
+              --convert-to xlsx --outdir "$destination" "$staging/input.csv" \
+              > "$destination/import.stdout" 2> "$destination/import.stderr" || true
+            rm -rf "$profile"
+          done < <(find final-run/impact-out -type f -iname '*.csv' -print0)
+
+          # Open converted workbooks again to force normal spreadsheet recalculation.
+          while IFS= read -r -d '' workbook; do
+            profile="$(mktemp -d)"
+            timeout -k 10s 45s libreoffice \
+              -env:UserInstallation="file://$profile" --headless \
+              --convert-to xlsx --outdir "$(dirname "$workbook")" "$workbook" \
+              >> final-run/results/recalc.stdout 2>> final-run/results/recalc.stderr || true
+            rm -rf "$profile"
+          done < <(find final-run/impact-converted final-run/control-converted -type f -iname '*.xlsx' -print0)
+          sleep 5
+
+      - name: Analyze independent impact validation
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python3 -m pip install --break-system-packages openpyxl >/dev/null 2>&1 || true
+          python3 agent8-final/analyze_impact.py
+          cat final-run/csv-impact.json
+
+      - name: Generate final report and any H1 draft
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 agent8-final/finalize.py | tee final-run/results/final-summary.txt
+          cp final-run/csv-impact.json final-run/results/csv-impact.json
+          cp final-run/duplicate-scan.json final-run/results/duplicate-scan.json
+          cp final-run/h1-scope.json final-run/results/h1-scope.json
+          cp final-run/secondwave.json final-run/results/secondwave.json
+          cp final-run/thirdwave.json final-run/results/thirdwave.json
+
+      - name: Package final evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p agent8-final-results
+          cp final-run/results/FINAL_RESULT.json agent8-final-results/FINAL_RESULT.json
+          cp final-run/results/FINAL_REPORT.md agent8-final-results/FINAL_REPORT.md
+          cp final-run/results/FINDING-*-H1.md agent8-final-results/ 2>/dev/null || true
+          cp final-run/results/final-summary.txt agent8-final-results/final-summary.txt
+          cp final-run/results/current-binary-* agent8-final-results/ 2>/dev/null || true
+          cp final-run/results/libreoffice-version.txt agent8-final-results/ 2>/dev/null || true
+          cp final-run/results/csv-impact.json agent8-final-results/
+          cp final-run/results/duplicate-scan.json agent8-final-results/
+          cp final-run/results/h1-scope.json agent8-final-results/
+          cp final-run/results/secondwave.json agent8-final-results/
+          cp final-run/results/thirdwave.json agent8-final-results/
+          cp final-run/results/impact-seed.log agent8-final-results/ 2>/dev/null || true
+          cp final-run/results/impact-output-files.txt agent8-final-results/ 2>/dev/null || true
+          find agent8-final-results -type f -printf '%P %s\n' | sort > agent8-final-results/MANIFEST.txt
+          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-mongosql-final-evidence.tar.gz agent8-final-results
+          sha256sum agent8-mongosql-final-evidence.tar.gz > agent8-mongosql-final-evidence.tar.gz.sha256
+
+      - name: Commit final result to branch
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git config user.name agent8-validation-bot
+          git config user.email agent8-validation-bot@users.noreply.github.com
+          git add agent8-final-results
+          git commit -m 'test: record Agent 8 final MongoSQL verdict' || true
+          git push origin HEAD:agent8-mongosql-final-20260830 || true
+
+      - name: Upload final evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent8-mongosql-final-evidence
+          path: |
+            agent8-mongosql-final-evidence.tar.gz
+            agent8-mongosql-final-evidence.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
