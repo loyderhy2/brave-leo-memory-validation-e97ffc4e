@@ -1,0 +1,194 @@
+name: Agent 8 MongoSQL TRR edge validation
+
+on:
+  push:
+    branches:
+      - agent8-mongosql-trr-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  edge-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download official TRR 1.1.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence/bin evidence/run
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-linux \
+            -o evidence/bin/AtlasSQLReadinessReport-linux
+          chmod +x evidence/bin/AtlasSQLReadinessReport-linux
+          evidence/bin/AtlasSQLReadinessReport-linux --version | tee evidence/bin/version.txt
+          sha256sum evidence/bin/AtlasSQLReadinessReport-linux | tee evidence/bin/sha256.txt
+
+      - name: Seed output-context edge cases
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker run -d --name mongo \
+            -p 127.0.0.1:27017:27017 \
+            -e MONGO_INITDB_ROOT_USERNAME=trruser \
+            -e MONGO_INITDB_ROOT_PASSWORD=TRR_SECRET_CANARY_7A91FD \
+            mongo:8.0 --bind_ip_all
+
+          ready=0
+          for i in $(seq 1 90); do
+            if docker exec mongo mongosh --quiet -u trruser -p TRR_SECRET_CANARY_7A91FD \
+              --authenticationDatabase admin --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+              ready=1; break
+            fi
+            sleep 2
+          done
+          test "$ready" = 1
+
+          cat > evidence/run/seed.js <<'JS'
+          function create(dbName, collName, document) {
+            try {
+              const d = db.getSiblingDB(dbName);
+              d.createCollection(collName);
+              d.getCollection(collName).insertOne(document);
+              print(`CREATED_DB=${JSON.stringify(dbName)} COLL=${JSON.stringify(collName)}`);
+            } catch (e) {
+              print(`FAILED_DB=${JSON.stringify(dbName)} COLL=${JSON.stringify(collName)} ERROR=${e}`);
+            }
+          }
+
+          create(
+            "trrcomplex",
+            "normal",
+            {
+              "<x-trr-schema-field-marker>": { nested: [1, 2] },
+              "quote\"attr-field": [{ child: 1 }],
+              "single'quote-field": { child: { deep: 1 } },
+              "=TRR_SCHEMA_FORMULA_FIELD": [1, 2]
+            }
+          );
+
+          const dbNames = [
+            "trrdbsafe",
+            "trrdb<x-trr-db-marker>",
+            "trrdb\"quote",
+            "trrdb&amp;entity-marker",
+            "trrdb\u0001control-marker",
+            "trrdb:colon-marker",
+            "trrdb?query-marker"
+          ];
+          for (const name of dbNames) {
+            create(name, "normal", { value: 1 });
+          }
+
+          create(
+            "trrterminal",
+            "normal_\u001b]0;TRR_SCHEMA_TERMINAL_MARKER\u0007_end",
+            { value: 1 }
+          );
+          JS
+
+          docker exec -i mongo mongosh --quiet -u trruser -p TRR_SECRET_CANARY_7A91FD \
+            --authenticationDatabase admin < evidence/run/seed.js \
+            2>&1 | tee evidence/run/seed.log
+
+      - name: Generate edge-case reports
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export BIN="$GITHUB_WORKSPACE/evidence/bin/AtlasSQLReadinessReport-linux"
+          export URI='mongodb://trruser:TRR_SECRET_CANARY_7A91FD@127.0.0.1:27017/admin?authSource=admin&directConnection=true&readPreference=primary&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000'
+
+          mkdir -p evidence/run/all/out evidence/run/terminal/out
+          timeout --signal=TERM --kill-after=10s 360s \
+            "$BIN" --uri "$URI" --output evidence/run/all/out --include 'trr*.*' --quiet \
+            </dev/null > evidence/run/all/stdout.txt 2> evidence/run/all/stderr.txt
+          echo $? > evidence/run/all/status.txt
+
+          cat > evidence/run/run-terminal.sh <<'SH'
+          #!/usr/bin/env bash
+          exec "$BIN" --uri "$URI" --output "$GITHUB_WORKSPACE/evidence/run/terminal/out" --include 'trrterminal.*'
+          SH
+          chmod +x evidence/run/run-terminal.sh
+          TERM=xterm-256color timeout --signal=TERM --kill-after=10s 360s \
+            script -q -e -c "$GITHUB_WORKSPACE/evidence/run/run-terminal.sh" \
+            evidence/run/terminal/typescript.bin \
+            > evidence/run/terminal/script.stdout 2> evidence/run/terminal/script.stderr
+          echo $? > evidence/run/terminal/status.txt
+
+      - name: Inspect paths HTML DOM CSV and terminal bytes
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          for case in all terminal; do
+            dir="evidence/run/$case"
+            find "$dir" -mindepth 1 -printf '%y %m %s %p -> %l\n' | sort > "$dir/tree.txt"
+            mkdir -p "$dir/unpacked"
+            for z in "$dir"/out/*.zip; do
+              [ -f "$z" ] && unzip -o "$z" -d "$dir/unpacked" >> "$dir/unzip.log" 2>&1
+            done
+            grep -RIna --binary-files=without-match -E \
+              'TRR_|x-trr|&lt;|&quot;|formula|control-marker|entity-marker|query-marker|colon-marker' \
+              "$dir/out" "$dir/unpacked" > "$dir/markers.txt" || true
+          done
+
+          grep -aob 'TRR_SCHEMA_TERMINAL_MARKER' evidence/run/terminal/typescript.bin \
+            > evidence/run/terminal/terminal-marker-offsets.txt || true
+          od -An -tx1 -c evidence/run/terminal/typescript.bin \
+            > evidence/run/terminal/typescript.od.txt || true
+
+          chrome=$(command -v google-chrome || command -v chromium || true)
+          echo "$chrome" > evidence/run/chrome-path.txt
+          if [ -n "$chrome" ]; then
+            while IFS= read -r -d '' html; do
+              safe=$(echo "$html" | tr '/ ' '__')
+              timeout 45s "$chrome" --headless --no-sandbox --disable-gpu \
+                --allow-file-access-from-files --dump-dom "file://$GITHUB_WORKSPACE/$html" \
+                > "evidence/run/DOM-$safe.txt" 2> "evidence/run/DOM-$safe.stderr" || true
+            done < <(find evidence/run/all/out -type f -name '*.html' -print0)
+          fi
+
+          grep -RIna --binary-files=without-match -E \
+            '<x-trr-schema-field-marker|<x-trr-db-marker|id=.TRR_' \
+            evidence/run/DOM-*.txt > evidence/run/dom-active-marker-grep.txt || true
+          grep -RIna --binary-files=without-match 'TRR_SECRET_CANARY_7A91FD' \
+            evidence/run/all/out evidence/run/all/stdout.txt evidence/run/all/stderr.txt \
+            evidence/run/terminal/out evidence/run/terminal/script.stdout evidence/run/terminal/script.stderr \
+            > evidence/run/tool-secret-leak-check.txt || true
+
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+          with Path('evidence/run/csv-analysis.txt').open('w', encoding='utf-8') as out:
+              for p in sorted(Path('evidence/run/all/unpacked').rglob('*.csv')):
+                  out.write(f'FILE {p}\n')
+                  try:
+                      with p.open(encoding='utf-8', newline='') as f:
+                          for i, row in enumerate(csv.reader(f), 1):
+                              out.write(f'ROW {i}: {row!r}\n')
+                  except Exception as exc:
+                      out.write(f'ERROR {exc!r}\n')
+          PY
+
+      - name: Package evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          docker logs mongo > evidence/run/mongodb.stdout.txt 2> evidence/run/mongodb.stderr.txt
+          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-trr-edge-evidence.tar.gz evidence
+          sha256sum agent8-trr-edge-evidence.tar.gz > agent8-trr-edge-evidence.tar.gz.sha256
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent8-trr-edge-evidence
+          path: |
+            agent8-trr-edge-evidence.tar.gz
+            agent8-trr-edge-evidence.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
