@@ -1,4 +1,4 @@
-name: Agent 6 MongoDB Official Binary Staging
+name: Agent 6 MongoDB Official Source Staging
 
 on:
   push:
@@ -10,31 +10,24 @@ permissions:
   contents: read
 
 jobs:
-  stage-binaries:
+  stage-source:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
-      - name: Download official MongoDB packages
+      - name: Download upstream tagged source
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p staged
+          source_url='https://github.com/mongodb/mongo-tools/archive/refs/tags/100.18.0.tar.gz'
+          curl -fsSL --retry 3 --retry-delay 2 "$source_url" -o staged/mongo-tools-100.18.0-source.tar.gz
+          sha256sum staged/mongo-tools-100.18.0-source.tar.gz | tee staged/SHA256SUMS.txt
+          printf '%s\n' "$source_url" > staged/SOURCES.txt
 
-          tools_url='https://fastdl.mongodb.org/tools/db/mongodb-database-tools-debian12-x86_64-100.18.0.tgz'
-          server_url='https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-debian12-8.0.29.tgz'
-          shell_url='https://github.com/mongodb-js/mongosh/releases/download/v2.9.2/mongosh-2.9.2-linux-x64-openssl3.tgz'
-
-          curl -fsSL --retry 3 --retry-delay 2 "$tools_url" -o staged/mongodb-database-tools-debian12-x86_64-100.18.0.tgz
-          curl -fsSL --retry 3 --retry-delay 2 "$server_url" -o staged/mongodb-linux-x86_64-debian12-8.0.29.tgz
-          curl -fsSL --retry 3 --retry-delay 2 "$shell_url" -o staged/mongosh-2.9.2-linux-x64-openssl3.tgz
-
-          sha256sum staged/*.tgz | tee staged/SHA256SUMS.txt
-          printf '%s\n%s\n%s\n' "$tools_url" "$server_url" "$shell_url" > staged/SOURCES.txt
-
-      - name: Upload official packages
+      - name: Upload tagged source
         uses: actions/upload-artifact@v4
         with:
-          name: agent6-official-mongodb-binaries-with-shell
+          name: agent6-mongo-tools-100.18.0-source
           path: staged
           if-no-files-found: error
           retention-days: 1
