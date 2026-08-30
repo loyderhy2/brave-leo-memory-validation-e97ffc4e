@@ -1,0 +1,16 @@
+{
+  "assets": [],
+  "sources": [
+    {
+      "url": "https://hackerone.com/mongodb?type=team",
+      "status": 200,
+      "length": 3490
+    },
+    {
+      "url": "https://hackerone.com/mongodb/policy_scopes",
+      "status": 200,
+      "length": 1806
+    }
+  ],
+  "errors": []
+}

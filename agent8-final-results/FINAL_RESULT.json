@@ -1,0 +1,466 @@
+{
+  "generated_at": "2026-08-30T11:18:17.853561+00:00",
+  "shipped_binary_version": "1.1.3",
+  "current_fixed_line": true,
+  "recommended_hackerone_asset": "MongoDB Connectors (recommended product-family mapping; verify exact H1 selector label)",
+  "scope_assets_seen": [],
+  "submission_ready_count": 0,
+  "medium_count": 0,
+  "low_count": 0,
+  "submission_ready": [],
+  "all_technical_candidates": [],
+  "candidate_statuses": [
+    {
+      "name": "HTML: server metadata in body/attribute/script/URL sibling contexts",
+      "verdict": "INCONCLUSIVE",
+      "evidence": "callbacks=0, active elements=0, success=False"
+    },
+    {
+      "name": "HTML: BI log input path/filename",
+      "verdict": "DISPROVED",
+      "evidence": "DOM execution=False, log run=True"
+    },
+    {
+      "name": "CSV: exact leading =,+,-,@ regression",
+      "verdict": "FIXED",
+      "evidence": "formula labels in imported TRR workbook=[]"
+    },
+    {
+      "name": "CSV: leading whitespace/control-prefix bypass",
+      "verdict": "DISPROVED",
+      "evidence": "controls=['plain_eq'], TRR formulas=[], bypass labels=[], impact formula=False, callback=False"
+    },
+    {
+      "name": "URL launch / arbitrary OS protocol",
+      "verdict": "INCONCLUSIVE",
+      "evidence": "non-http links=0, external-open execs=0"
+    },
+    {
+      "name": "Credential leakage in success/error/generated output",
+      "verdict": "DISPROVED",
+      "evidence": "canary hits=0, auth path exercised=True"
+    },
+    {
+      "name": "Output-path traversal / overwrite",
+      "verdict": "INCONCLUSIVE",
+      "evidence": "marker-controlled files outside output=[]"
+    },
+    {
+      "name": "mongosql-cli terminal-control output",
+      "verdict": "CLOSED_NOT_SHIPPED",
+      "evidence": "Current public release instructions enumerate libmongosqltranslate, libmongosql, and schema-builder-library, not mongosql-cli; no shipped-product execution path was established."
+    }
+  ],
+  "known_related_issues": [
+    "CVE-2026-76794",
+    "CVE-2026-76797",
+    "CVE-2026-76798"
+  ],
+  "public_duplicate_scan": {
+    "queries": [
+      {
+        "query": "\"MongoSQL Transition Readiness Tool\" \"1.1.3\" formula",
+        "status": 200,
+        "items": [],
+        "error": null
+      },
+      {
+        "query": "\"Transition Readiness Tool\" \"leading whitespace\" CSV",
+        "status": 200,
+        "items": [],
+        "error": null
+      },
+      {
+        "query": "\"CVE-2026-76797\" bypass",
+        "status": 200,
+        "items": [],
+        "error": null
+      },
+      {
+        "query": "\"CVE-2026-76797\" incomplete fix",
+        "status": 200,
+        "items": [],
+        "error": null
+      },
+      {
+        "query": "\"BI Connector Transition Readiness Report\" formula",
+        "status": 200,
+        "items": [],
+        "error": null
+      },
+      {
+        "query": "\"SQL-3322\" MongoSQL",
+        "status": 200,
+        "items": [],
+        "error": null
+      },
+      {
+        "query": "\"SQL-3320\" MongoSQL",
+        "status": 200,
+        "items": [],
+        "error": null
+      },
+      {
+        "query": "\"SQL-3321\" MongoSQL",
+        "status": 200,
+        "items": [],
+        "error": null
+      },
+      {
+        "query": "repo:mongodb/mongosql formula CSV security",
+        "status": 200,
+        "items": [],
+        "error": null
+      },
+      {
+        "query": "repo:mongodb/docs \"CVE-2026-76797\"",
+        "status": 200,
+        "items": [],
+        "error": null
+      }
+    ],
+    "direct_root_cause_hits": [],
+    "current_1_1_3_bypass_hits": [],
+    "known_cves": {
+      "CVE-2026-76794": {
+        "status": 200,
+        "url": "https://raw.githubusercontent.com/CVEProject/cvelistV5/main/cves/2026/76xxx/CVE-2026-76794.json",
+        "title": "MongoDB BI Connector Transition Readiness Report Improper HTML Encoding When Processing Database Metadata",
+        "description": "MongoSQL Transition Readiness Tool does not sufficiently encode database metadata before including it in generated HTML. A MongoDB user with write access can introduce crafted metadata that may cause script code to run when another user generates and opens the report, potentially exposing report contents or altering its display.",
+        "affected": [
+          {
+            "vendor": "MongoDB",
+            "product": "BI Connector Transition Readiness Report",
+            "versions": [
+              {
+                "status": "affected",
+                "version": "1.0.0",
+                "lessThan": "1.1.3",
+                "versionType": "semver"
+              }
+            ],
+            "defaultStatus": "unaffected"
+          }
+        ],
+        "metrics": [
+          {
+            "format": "CVSS",
+            "scenarios": [
+              {
+                "lang": "en",
+                "value": "GENERAL"
+              }
+            ],
+            "cvssV4_0": {
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "attackRequirements": "NONE",
+              "privilegesRequired": "LOW",
+              "userInteraction": "ACTIVE",
+              "vulnConfidentialityImpact": "LOW",
+              "subConfidentialityImpact": "NONE",
+              "vulnIntegrityImpact": "LOW",
+              "subIntegrityImpact": "NONE",
+              "vulnAvailabilityImpact": "NONE",
+              "subAvailabilityImpact": "NONE",
+              "exploitMaturity": "NOT_DEFINED",
+              "Safety": "NOT_DEFINED",
+              "Automatable": "NOT_DEFINED",
+              "Recovery": "NOT_DEFINED",
+              "valueDensity": "NOT_DEFINED",
+              "vulnerabilityResponseEffort": "NOT_DEFINED",
+              "providerUrgency": "NOT_DEFINED",
+              "version": "4.0",
+              "baseSeverity": "MEDIUM",
+              "baseScore": 4.8,
+              "vectorString": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:A/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N"
+            }
+          },
+          {
+            "format": "CVSS",
+            "scenarios": [
+              {
+                "lang": "en",
+                "value": "GENERAL"
+              }
+            ],
+            "cvssV3_1": {
+              "version": "3.1",
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "LOW",
+              "userInteraction": "REQUIRED",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "LOW",
+              "integrityImpact": "LOW",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "MEDIUM",
+              "baseScore": 4.6,
+              "vectorString": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:L/I:L/A:N"
+            }
+          }
+        ]
+      },
+      "CVE-2026-76797": {
+        "status": 200,
+        "url": "https://raw.githubusercontent.com/CVEProject/cvelistV5/main/cves/2026/76xxx/CVE-2026-76797.json",
+        "title": "MongoSQL Transition Readiness Tool Improper Neutralization of Formula Elements in Generated Reports",
+        "description": "The MongoSQL Transition Readiness Tool writes database and collection names into its generated CSV reports without neutralizing leading characters that spreadsheet applications treat as formulas. A user with write privileges on the cluster can choose a namespace name that is later evaluated as a formula when an operator opens the generated report in a spreadsheet application, which may result in unintended disclosure of report contents or execution of external content on the operator's workstation. Generating a report for the affected namespace and opening it in a spreadsheet application is required.",
+        "affected": [
+          {
+            "vendor": "MongoDB",
+            "product": "BI Connector Transition Readiness Report",
+            "versions": [
+              {
+                "status": "affected",
+                "version": "1.0.0",
+                "lessThan": "1.1.3",
+                "versionType": "semver"
+              }
+            ],
+            "defaultStatus": "unaffected"
+          }
+        ],
+        "metrics": [
+          {
+            "format": "CVSS",
+            "scenarios": [
+              {
+                "lang": "en",
+                "value": "GENERAL"
+              }
+            ],
+            "cvssV4_0": {
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "attackRequirements": "PRESENT",
+              "privilegesRequired": "LOW",
+              "userInteraction": "ACTIVE",
+              "vulnConfidentialityImpact": "HIGH",
+              "subConfidentialityImpact": "NONE",
+              "vulnIntegrityImpact": "LOW",
+              "subIntegrityImpact": "NONE",
+              "vulnAvailabilityImpact": "NONE",
+              "subAvailabilityImpact": "NONE",
+              "exploitMaturity": "NOT_DEFINED",
+              "Safety": "NOT_DEFINED",
+              "Automatable": "NOT_DEFINED",
+              "Recovery": "NOT_DEFINED",
+              "valueDensity": "NOT_DEFINED",
+              "vulnerabilityResponseEffort": "NOT_DEFINED",
+              "providerUrgency": "NOT_DEFINED",
+              "version": "4.0",
+              "baseSeverity": "MEDIUM",
+              "baseScore": 5.8,
+              "vectorString": "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:A/VC:H/VI:L/VA:N/SC:N/SI:N/SA:N"
+            }
+          },
+          {
+            "format": "CVSS",
+            "scenarios": [
+              {
+                "lang": "en",
+                "value": "GENERAL"
+              }
+            ],
+            "cvssV3_1": {
+              "version": "3.1",
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "LOW",
+              "userInteraction": "REQUIRED",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "HIGH",
+              "integrityImpact": "LOW",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "MEDIUM",
+              "baseScore": 6.3,
+              "vectorString": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:L/A:N"
+            }
+          }
+        ]
+      },
+      "CVE-2026-76798": {
+        "status": 200,
+        "url": "https://raw.githubusercontent.com/CVEProject/cvelistV5/main/cves/2026/76xxx/CVE-2026-76798.json",
+        "title": "MongoSQL Transition Readiness Tool Improper Output Encoding in Generated HTML Reports",
+        "description": "The MongoSQL Transition Readiness Tool writes query text and user names read from BI Connector log files into its generated HTML report without encoding them for that output context. A user able to issue queries through the BI Connector can influence log content so that markup supplied in a query is interpreted by the browser when an operator later generates and opens the report, which may disclose other users' logged query text and user names to an external party or present misleading content to the operator. Generating a report over logs containing the affected entries and opening that report in a browser is required.",
+        "affected": [
+          {
+            "vendor": "MongoDB",
+            "product": "BI Connector Transition Readiness Report",
+            "versions": [
+              {
+                "status": "affected",
+                "version": "1.0.0",
+                "lessThan": "1.1.3",
+                "versionType": "semver"
+              }
+            ],
+            "defaultStatus": "unaffected"
+          }
+        ],
+        "metrics": [
+          {
+            "format": "CVSS",
+            "scenarios": [
+              {
+                "lang": "en",
+                "value": "GENERAL"
+              }
+            ],
+            "cvssV4_0": {
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "attackRequirements": "NONE",
+              "privilegesRequired": "LOW",
+              "userInteraction": "ACTIVE",
+              "vulnConfidentialityImpact": "HIGH",
+              "subConfidentialityImpact": "NONE",
+              "vulnIntegrityImpact": "LOW",
+              "subIntegrityImpact": "NONE",
+              "vulnAvailabilityImpact": "NONE",
+              "subAvailabilityImpact": "NONE",
+              "exploitMaturity": "NOT_DEFINED",
+              "Safety": "NOT_DEFINED",
+              "Automatable": "NOT_DEFINED",
+              "Recovery": "NOT_DEFINED",
+              "valueDensity": "NOT_DEFINED",
+              "vulnerabilityResponseEffort": "NOT_DEFINED",
+              "providerUrgency": "NOT_DEFINED",
+              "version": "4.0",
+              "baseSeverity": "MEDIUM",
+              "baseScore": 6.9,
+              "vectorString": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:A/VC:H/VI:L/VA:N/SC:N/SI:N/SA:N"
+            }
+          },
+          {
+            "format": "CVSS",
+            "scenarios": [
+              {
+                "lang": "en",
+                "value": "GENERAL"
+              }
+            ],
+            "cvssV3_1": {
+              "version": "3.1",
+              "attackVector": "NETWORK",
+              "attackComplexity": "LOW",
+              "privilegesRequired": "LOW",
+              "userInteraction": "REQUIRED",
+              "scope": "UNCHANGED",
+              "confidentialityImpact": "HIGH",
+              "integrityImpact": "LOW",
+              "availabilityImpact": "NONE",
+              "baseSeverity": "MEDIUM",
+              "baseScore": 6.3,
+              "vectorString": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:L/A:N"
+            }
+          }
+        ]
+      }
+    },
+    "docs": {
+      "transition_guide": {
+        "status": 200,
+        "url": "https://raw.githubusercontent.com/mongodb/docs/main/content/sql-interface/source/transition-bic-to-atlas-sql.txt",
+        "relevant_lines": [
+          "   :keywords: bi connector, sql",
+          "   :description: Migrate from Atlas BI Connector to Atlas SQL for enhanced data analysis capabilities and cost efficiency.",
+          "   The {+abic+} and the on-premises BI Connector",
+          "- You can use custom MongoDB connectors for Tableau and Power BI.",
+          ":ref:`Transition Readiness Report <bic-asql-transition-report-tool>` ",
+          "Generate a Transition Readiness Report",
+          "MongoDB provides an {+asql+} Transition Readiness Tool to help you",
+          "            <https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-macos-arm>`__.",
+          "            <https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-macos>`__.",
+          "            <https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-linux>`__.",
+          "            <https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-win.exe>`__."
+        ]
+      },
+      "changelog": {
+        "status": 200,
+        "url": "https://raw.githubusercontent.com/mongodb/docs/main/content/sql-interface/source/changelog.txt",
+        "relevant_lines": [
+          "   :description: Explore feature updates, bug fixes, and changes in MongoDB Atlas SQL Interface drivers and connectors across all versioned releases and compatibility notes.",
+          "   MongoDB releases {+sql-interface+} drivers and connectors in a continuous deployment ",
+          "- Updates the {+asql+} Transition Readiness Tool to version 1.1.3.",
+          "    `CVE-2026-76798",
+          "    <https://www.cve.org/CVERecord?id=CVE-2026-76798>`__ and",
+          "    `CVE-2026-76794",
+          "    <https://www.cve.org/CVERecord?id=CVE-2026-76794>`__.",
+          "    `CVE-2026-76797",
+          "    <https://www.cve.org/CVERecord?id=CVE-2026-76797>`__.",
+          "   3.0.4 or later and the Tableau custom connector to 1.4.5 or later.",
+          "- Updates the Tableau custom connector (for the MongoDB JDBC driver) to version 1.4.5.",
+          "  drivers and connectors for both {+service+} and on-premises deployments. This ",
+          "- Updates the Tableau custom connector (for the MongoDB |jdbc| driver) to version 1.4.4.",
+          "- Updates the Tableau custom connector (for the MongoDB JDBC driver) to version 1.4.2.",
+          "- Renamed the connector from MongoDB Atlas to MongoDB SQL Interface.",
+          "- Updates the Tableau custom connector (for the MongoDB JDBC driver) to",
+          "- Moves the logging information UI for the Tableau Connector into an",
+          "- Updates the Tableau custom connector (for the MongoDB JDBC driver) to ",
+          "- Updates the Power BI connector to version 1.2.0.",
+          "- Updates the Power BI connector to version 1.1.1, which fixes a bug",
+          "- Updates the Power BI connector to version 1.1.0, which adds the ",
+          "- Updates the Power BI connector to version 1.0.1, which adds ",
+          "- Updates the Power BI connector to version 1.0.0.",
+          "- Updates the Tableau custom connector (for the MongoDB JDBC driver) to ",
+          "- Updates the Tableau custom connector (for the MongoDB JDBC driver) to "
+        ]
+      },
+      "mongosql_release": {
+        "status": 200,
+        "url": "https://raw.githubusercontent.com/mongodb/mongosql/main/RELEASE.md",
+        "relevant_lines": [
+          "1. `libmongosqltranslate` - used by the ODBC and JDBC drivers for on-prem and direct cluster querying.",
+          "2. `libmongosql` - used by ADF.",
+          "3. `schema-builder-library` - a Rust library, also distributed as a WASM package, for partitioning MongoDB collections and deriving their schemas.",
+          "### Versioning `libmongosqltranslate`",
+          "`libmongosqltranslate` uses the following guidelines to determine when each version component will be updated:",
+          "Tags are prepended with `libv` for `libmongosqltranslate` releases.",
+          "### Versioning `libmongosql`",
+          "`libmongosql` uses the following guidelines to determine when each version component will be updated:",
+          "At the moment, there are no pre-release (alpha, beta, rc, etc.) versions of `libmongosql`.",
+          "Tags are prepended with `v` for `libmongosql` releases.",
+          "### Versioning `schema-builder-library`",
+          "`schema-builder-library` uses the following guidelines to determine when each version component will be updated:",
+          "At the moment, there are no pre-release (alpha, beta, rc, etc.) versions of `schema-builder-library`.",
+          "Tags are prepended with `sbl` for `schema-builder-library` releases.",
+          "Make sure the libraries are available at the proper urls. They should be available in the `translators-connectors-releases` bucket,",
+          "### ADF downstream Ticket and Library Update for `libmongosql`",
+          "The following sections currently only apply to `libmongosql` releases."
+        ]
+      }
+    }
+  },
+  "raw_gates": {
+    "secondwave_load_error": null,
+    "thirdwave_load_error": null,
+    "impact_load_error": null,
+    "version": "1.1.3",
+    "success_ok": false,
+    "schema_ok": true,
+    "log_ok": true,
+    "seed_failed": false,
+    "control_labels": [
+      "plain_eq"
+    ],
+    "trr_labels": [],
+    "confirmed_labels": [],
+    "bypass_labels": [],
+    "plain_labels": [],
+    "impact_formula": false,
+    "impact_callback": false,
+    "impact_hyperlink": false,
+    "html_callbacks": 0,
+    "active_html": 0,
+    "log_path_exec": false,
+    "non_http_links": 0,
+    "external_open_execs": 0,
+    "secret_hits": 0,
+    "path_escape_files": [],
+    "neutralized_cells": 0,
+    "formula_cells": 0
+  }
+}

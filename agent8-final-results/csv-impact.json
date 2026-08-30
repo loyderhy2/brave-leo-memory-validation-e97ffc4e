@@ -1,0 +1,17 @@
+{
+  "selected_label": null,
+  "available_labels": [],
+  "skipped": true,
+  "run_ok": false,
+  "formula_preserved": false,
+  "hyperlink_formula_preserved": false,
+  "automatic_callback": false,
+  "control_formula_preserved": false,
+  "direct_negative_is_formula": false,
+  "normal_negative_is_formula": false,
+  "raw_csv_hits": [],
+  "trr_formula_cells": [],
+  "control_formula_cells": [],
+  "callbacks": [],
+  "errors": []
+}
