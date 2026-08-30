@@ -11,43 +11,36 @@ permissions:
 jobs:
   validate-trr:
     runs-on: ubuntu-24.04
-    timeout-minutes: 12
+    timeout-minutes: 20
     steps:
       - name: Check out validation branch
         uses: actions/checkout@v4
 
-      - name: Download and identify current MongoSQL Transition Readiness Tool
+      - name: Download official Transition Readiness Tool
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p evidence/bin evidence/run/sandbox/out
+          mkdir -p evidence/bin evidence/run
           curl --fail --location --retry 5 --retry-all-errors \
             https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-linux \
             --output evidence/bin/AtlasSQLReadinessReport-linux
           chmod +x evidence/bin/AtlasSQLReadinessReport-linux
           sha256sum evidence/bin/AtlasSQLReadinessReport-linux | tee evidence/bin/sha256.txt
           file evidence/bin/AtlasSQLReadinessReport-linux | tee evidence/bin/file.txt
-          (ldd evidence/bin/AtlasSQLReadinessReport-linux || true) | tee evidence/bin/ldd.txt
-          (evidence/bin/AtlasSQLReadinessReport-linux --version || true) 2>&1 | tee evidence/bin/version.txt
-          (evidence/bin/AtlasSQLReadinessReport-linux --help || true) 2>&1 | tee evidence/bin/help.txt
-          strings -a evidence/bin/AtlasSQLReadinessReport-linux > evidence/bin/strings.txt
+          evidence/bin/AtlasSQLReadinessReport-linux --version 2>&1 | tee evidence/bin/version.txt
+          evidence/bin/AtlasSQLReadinessReport-linux --help 2>&1 | tee evidence/bin/help.txt
 
-      - name: Start local MongoDB and seed adversarial metadata
+      - name: Start unauthenticated local MongoDB and seed matrix
         shell: bash
         run: |
           set -euxo pipefail
           docker run --detach --name agent8-mongo \
             --publish 127.0.0.1:27017:27017 \
-            --env MONGO_INITDB_ROOT_USERNAME=trruser \
-            --env MONGO_INITDB_ROOT_PASSWORD=TRR_SECRET_CANARY_7A91FD \
-            mongo:8.0
+            mongo:8.0 --bind_ip_all
 
           ready=0
-          for attempt in $(seq 1 60); do
-            if docker exec agent8-mongo mongosh --quiet \
-              --username trruser --password TRR_SECRET_CANARY_7A91FD \
-              --authenticationDatabase admin \
-              --eval 'db.adminCommand({ ping: 1 })' >/dev/null 2>&1; then
+          for attempt in $(seq 1 90); do
+            if docker exec agent8-mongo mongosh --quiet --eval 'db.adminCommand({ ping: 1 })' >/dev/null 2>&1; then
               ready=1
               break
             fi
@@ -56,93 +49,174 @@ jobs:
           test "$ready" = 1
 
           cat > evidence/run/seed.js <<'JAVASCRIPT'
-          const target = db.getSiblingDB("trrtest");
-          const collections = [
-            "normal",
-            "../TRR_PATH_MARKER_PARENT",
-            "../../TRR_PATH_MARKER_GRANDPARENT",
-            "nested/TRR_PATH_MARKER_CHILD",
-            "quote\"attr-marker",
-            "single'quote-marker",
-            "<b id=TRR_HTML_COLLECTION_MARKER>collection</b>",
-            "=HYPERLINK(\"http://127.0.0.1:8765/TRR_CSV_COLLECTION_MARKER\",\"open\")",
-            "+SUM(1,1)",
-            "-1+1",
-            "@SUM(1,1)"
+          const cases = [
+            {
+              db: "trrbase",
+              collection: "normal",
+              document: { normal: 1 }
+            },
+            {
+              db: "trrhtml",
+              collection: "<img id=TRR_SCHEMA_COLLECTION_HTML_MARKER src=x>",
+              document: {
+                "<svg id=TRR_SCHEMA_FIELD_HTML_MARKER>": 1,
+                "quote\"attr-field": 2,
+                "single'quote-field": 3
+              }
+            },
+            {
+              db: "trrcsv",
+              collection: "=1+1",
+              document: { "=2+2": 1, "+3+3": 2, "-4+4": 3, "@SUM(1,1)": 4 }
+            },
+            {
+              db: "trrcsv",
+              collection: "\t=5+5",
+              document: { "\t=6+6": 1, "\r=7+7": 2, "\u00a0=8+8": 3 }
+            },
+            {
+              db: "trrpath",
+              collection: "nested/TRR_PATH_SLASH_MARKER",
+              document: { "nested/TRR_FIELD_PATH_MARKER": 1 }
+            },
+            {
+              db: "trrpath",
+              collection: "nestedTRR_PATH_SLASH_MARKER",
+              document: { normal: 1 }
+            }
           ];
 
-          for (const name of collections) {
+          for (const c of cases) {
             try {
-              target.createCollection(name);
-              target.getCollection(name).insertOne({
-                normal: 1,
-                "../TRR_FIELD_PATH_MARKER": "path",
-                "quote\"attr-field": "attribute",
-                "single'quote-field": "attribute",
-                "<i id=TRR_HTML_FIELD_MARKER>field</i>": "html",
-                "=HYPERLINK(\"http://127.0.0.1:8765/TRR_CSV_FIELD_MARKER\",\"open\")": "formula",
-                "+SUM(2,2)": "plus",
-                "-2+2": "minus",
-                "@SUM(2,2)": "at"
-              });
-              print(`CREATED:${name}`);
+              const target = db.getSiblingDB(c.db);
+              target.createCollection(c.collection);
+              target.getCollection(c.collection).insertOne(c.document);
+              print(`CREATED:${c.db}:${JSON.stringify(c.collection)}`);
             } catch (e) {
-              print(`FAILED:${name}:${e}`);
+              print(`FAILED:${c.db}:${JSON.stringify(c.collection)}:${e}`);
             }
           }
 
-          printjson(target.getCollectionNames());
+          for (const dbName of ["trrbase", "trrhtml", "trrcsv", "trrpath"]) {
+            print(`DATABASE:${dbName}`);
+            printjson(db.getSiblingDB(dbName).getCollectionNames());
+          }
           JAVASCRIPT
 
-          docker exec -i agent8-mongo mongosh --quiet \
-            --username trruser --password TRR_SECRET_CANARY_7A91FD \
-            --authenticationDatabase admin \
-            < evidence/run/seed.js 2>&1 | tee evidence/run/seed.log
+          docker exec -i agent8-mongo mongosh --quiet < evidence/run/seed.js \
+            2>&1 | tee evidence/run/seed.log
 
-      - name: Generate current reports inside a guarded output directory
+      - name: Run baseline and adversarial schema reports
         shell: bash
         run: |
-          set -u
-          cd evidence/run/sandbox
-          printf 'GUARD_PARENT\n' > TRR_PARENT_GUARD.txt
-          printf 'GUARD_OUTPUT\n' > out/TRR_OUTPUT_GUARD.txt
-          find .. -mindepth 1 -printf 'BEFORE %y %p\n' | sort > ../tree-before.txt
+          set -uo pipefail
+          BIN="$GITHUB_WORKSPACE/evidence/bin/AtlasSQLReadinessReport-linux"
+          URI='mongodb://127.0.0.1:27017/?directConnection=true&readPreference=primary&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000'
+          mkdir -p evidence/run/baseline/out evidence/run/matrix/out
 
+          run_case() {
+            local name="$1"
+            local include="$2"
+            local dir="$GITHUB_WORKSPACE/evidence/run/$name"
+            (
+              while true; do
+                date -u '+MONITOR %Y-%m-%dT%H:%M:%SZ'
+                ps -eo pid,ppid,stat,etime,cmd | grep -E 'AtlasSQLReadinessReport|mongod' | grep -v grep || true
+                sleep 20
+              done
+            ) > "$dir/process-monitor.txt" 2>&1 &
+            local monitor_pid=$!
+
+            set +e
+            timeout --signal=TERM --kill-after=15s 360s \
+              "$BIN" \
+                --uri "$URI" \
+                --output "$dir/out" \
+                --include "$include" \
+                --quiet \
+                </dev/null > "$dir/stdout.txt" 2> "$dir/stderr.txt"
+            local status=$?
+            set -e
+            kill "$monitor_pid" >/dev/null 2>&1 || true
+            wait "$monitor_pid" >/dev/null 2>&1 || true
+            printf '%s\n' "$status" > "$dir/exit-status.txt"
+          }
+
+          run_case baseline 'trrbase.normal'
+          run_case matrix 'trr*.*'
+
+      - name: Analyze generated output bytes and browser DOM
+        if: always()
+        shell: bash
+        run: |
           set +e
-          timeout --signal=TERM --kill-after=10s 120s \
-            ../../bin/AtlasSQLReadinessReport-linux \
-              --uri 'mongodb://trruser:TRR_SECRET_CANARY_7A91FD@127.0.0.1:27017/admin?authSource=admin' \
-              --output "$PWD/out" \
-              --include 'trrtest.*' \
-              </dev/null > ../stdout.txt 2> ../stderr.txt
-          status=$?
-          set -e
-          printf '%s\n' "$status" > ../exit-status.txt
+          command -v google-chrome > evidence/run/browser-path.txt 2>&1 || \
+            command -v chromium >> evidence/run/browser-path.txt 2>&1 || true
 
-          find .. -mindepth 1 -printf 'AFTER %y %m %s %p -> %l\n' | sort > ../tree-after.txt
-          find "$PWD/out" -mindepth 1 -maxdepth 10 -printf '%y %m %s %p -> %l\n' | sort > ../output-tree.txt
-          grep -RIna --binary-files=without-match \
-            -e 'TRR_' -e 'HYPERLINK' -e '<b' -e '<i' -e 'href=' -e 'src=' \
-            "$PWD/out" > ../marker-grep.txt || true
-          grep -RIna --binary-files=without-match 'TRR_SECRET_CANARY_7A91FD' .. > ../secret-grep.txt || true
-          diff -u ../tree-before.txt ../tree-after.txt > ../tree.diff || true
+          for case in baseline matrix; do
+            dir="evidence/run/$case"
+            find "$dir" -mindepth 1 -printf '%y %m %s %p -> %l\n' | sort > "$dir/output-tree.txt"
+            grep -RIna --binary-files=without-match \
+              -e 'TRR_' -e 'HYPERLINK' -e '<img' -e '<svg' -e '&lt;' \
+              "$dir/out" > "$dir/marker-grep.txt" || true
 
-      - name: Preserve container logs and package evidence
+            mkdir -p "$dir/unpacked"
+            for zip in "$dir"/out/*.zip "$dir"/out/**/*.zip; do
+              [ -f "$zip" ] || continue
+              unzip -o "$zip" -d "$dir/unpacked" >> "$dir/unzip.log" 2>&1 || true
+            done
+
+            grep -RIna --binary-files=without-match \
+              -e 'TRR_' -e '=1+1' -e '=2+2' -e '=5+5' -e '=6+6' \
+              "$dir/unpacked" > "$dir/unpacked-marker-grep.txt" || true
+
+            browser=$(command -v google-chrome || command -v chromium || true)
+            if [ -n "$browser" ]; then
+              for html in $(find "$dir/out" -type f -name '*.html'); do
+                safe=$(echo "$html" | tr '/ ' '__')
+                timeout 60s "$browser" --headless --no-sandbox --disable-gpu \
+                  --allow-file-access-from-files --dump-dom "file://$GITHUB_WORKSPACE/$html" \
+                  > "$dir/DOM-$safe.txt" 2> "$dir/DOM-$safe.stderr" || true
+              done
+            fi
+          done
+
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+
+          root = Path('evidence/run')
+          with (root / 'csv-cell-analysis.txt').open('w', encoding='utf-8') as out:
+              for case in ('baseline', 'matrix'):
+                  for path in sorted((root / case / 'unpacked').rglob('*.csv')):
+                      out.write(f'FILE {path}\n')
+                      try:
+                          with path.open('r', encoding='utf-8', newline='') as f:
+                              for rno, row in enumerate(csv.reader(f), 1):
+                                  out.write(f'ROW {rno}: {row!r}\n')
+                                  for cno, cell in enumerate(row, 1):
+                                      if cell and (cell[0] in '=+-@\t\r\n' or 'TRR_' in cell):
+                                          out.write(f'  INTERESTING r={rno} c={cno} first={ord(cell[0]):#x} value={cell!r}\n')
+                      except Exception as exc:
+                          out.write(f'ERROR {exc!r}\n')
+          PY
+
+      - name: Preserve evidence
         if: always()
         shell: bash
         run: |
           set +e
           docker logs agent8-mongo > evidence/run/mongodb.stdout.txt 2> evidence/run/mongodb.stderr.txt
-          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-mongosql-trr-evidence.tar.gz evidence
-          sha256sum agent8-mongosql-trr-evidence.tar.gz > agent8-mongosql-trr-evidence.tar.gz.sha256
+          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-mongosql-trr-schema-matrix.tar.gz evidence
+          sha256sum agent8-mongosql-trr-schema-matrix.tar.gz > agent8-mongosql-trr-schema-matrix.tar.gz.sha256
 
       - name: Upload validation evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent8-mongosql-trr-evidence
+          name: agent8-mongosql-trr-schema-matrix
           path: |
-            agent8-mongosql-trr-evidence.tar.gz
-            agent8-mongosql-trr-evidence.tar.gz.sha256
+            agent8-mongosql-trr-schema-matrix.tar.gz
+            agent8-mongosql-trr-schema-matrix.tar.gz.sha256
           if-no-files-found: error
           retention-days: 7
