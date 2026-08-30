@@ -1,0 +1,39 @@
+name: Agent 6 MongoDB Official Binary Staging
+
+on:
+  push:
+    branches:
+      - agent6-mongodb-binaries-20260830
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stage-binaries:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Download official MongoDB packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+
+          tools_url='https://fastdl.mongodb.org/tools/db/mongodb-database-tools-debian12-x86_64-100.18.0.tgz'
+          server_url='https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-debian12-8.0.29.tgz'
+
+          curl -fsSL --retry 3 --retry-delay 2 "$tools_url" -o staged/mongodb-database-tools-debian12-x86_64-100.18.0.tgz
+          curl -fsSL --retry 3 --retry-delay 2 "$server_url" -o staged/mongodb-linux-x86_64-debian12-8.0.29.tgz
+
+          sha256sum staged/*.tgz | tee staged/SHA256SUMS.txt
+          printf '%s\n%s\n' "$tools_url" "$server_url" > staged/SOURCES.txt
+
+      - name: Upload official packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent6-official-mongodb-binaries
+          path: staged
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
