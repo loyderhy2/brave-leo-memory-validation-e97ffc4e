@@ -1,0 +1,167 @@
+name: Agent 8 TRR 1.1.3 second-wave validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent8-mongosql-trr-secondwave-20260830
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install analysis utilities
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y strace
+          python3 -m pip install --break-system-packages beautifulsoup4
+          command -v google-chrome
+
+      - name: Download current shipped TRR
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p secondwave/bin secondwave/work/out secondwave/results
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-linux \
+            -o secondwave/bin/AtlasSQLReadinessReport-linux
+          chmod +x secondwave/bin/AtlasSQLReadinessReport-linux
+          sha256sum secondwave/bin/AtlasSQLReadinessReport-linux > secondwave/results/binary-sha256.txt
+          secondwave/bin/AtlasSQLReadinessReport-linux --version > secondwave/results/version.txt 2>&1 || true
+          secondwave/bin/AtlasSQLReadinessReport-linux --help > secondwave/results/help.txt 2>&1 || true
+          strings -a secondwave/bin/AtlasSQLReadinessReport-linux > secondwave/results/strings.txt
+
+      - name: Start local MongoDB and callback server
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker run -d --name agent8-mongo \
+            -p 127.0.0.1:27017:27017 \
+            -e MONGO_INITDB_ROOT_USERNAME=trruser \
+            -e MONGO_INITDB_ROOT_PASSWORD='TRR_SECRET_CANARY_7A91FD' \
+            mongo:8.0
+          ready=0
+          for i in $(seq 1 90); do
+            if docker exec agent8-mongo mongosh --quiet \
+              -u trruser -p 'TRR_SECRET_CANARY_7A91FD' \
+              --authenticationDatabase admin \
+              --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = 1
+          cat > secondwave/callback.py <<'PY'
+          from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+          from pathlib import Path
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  with Path('secondwave/results/browser-callbacks.log').open('a') as out:
+                      out.write(self.path + '\n')
+                  self.send_response(204)
+                  self.end_headers()
+              def log_message(self, *args):
+                  pass
+          ThreadingHTTPServer(('127.0.0.1', 8765), Handler).serve_forever()
+          PY
+          python3 secondwave/callback.py > secondwave/results/callback-server.log 2>&1 &
+          echo $! > secondwave/results/callback-server.pid
+
+      - name: Seed harmless adversarial metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker exec -i agent8-mongo mongosh --quiet \
+            -u trruser -p 'TRR_SECRET_CANARY_7A91FD' \
+            --authenticationDatabase admin \
+            < agent8-secondwave/seed.js \
+            > secondwave/results/seed.log 2>&1
+
+      - name: Run success and authentication-error paths under tracing
+        shell: bash
+        run: |
+          set -u
+          cd secondwave/work
+          printf GUARD_PARENT > TRR_PARENT_GUARD.txt
+          printf GUARD_OUT > out/TRR_OUT_GUARD.txt
+          find . -printf '%y %m %s %p -> %l\n' | sort > ../results/tree-before.txt
+
+          set +e
+          timeout -k 10s 180s strace -ff -s 4096 -o ../results/strace-success \
+            ../bin/AtlasSQLReadinessReport-linux \
+              --uri 'mongodb://trruser:TRR_SECRET_CANARY_7A91FD@127.0.0.1:27017/admin?authSource=admin' \
+              --output "$PWD/out" \
+              --include 'trrtest.*' \
+              </dev/null > ../results/success.stdout 2> ../results/success.stderr
+          echo $? > ../results/success.exit
+
+          timeout -k 10s 45s ../bin/AtlasSQLReadinessReport-linux \
+              --uri 'mongodb://trruser:TRR_SECRET_CANARY_7A91FD_WRONG@127.0.0.1:27017/admin?authSource=admin' \
+              --output "$PWD/auth-error-out" \
+              --include 'trrtest.normal' \
+              </dev/null > ../results/auth-error.stdout 2> ../results/auth-error.stderr
+          echo $? > ../results/auth-error.exit
+          set -e
+
+          find . -printf '%y %m %s %p -> %l\n' | sort > ../results/tree-after.txt
+          diff -u ../results/tree-before.txt ../results/tree-after.txt > ../results/tree.diff || true
+          find out -type f -printf '%P\n' | sort > ../results/output-files.txt
+
+      - name: Open every generated HTML report in a real browser
+        shell: bash
+        run: |
+          set -euxo pipefail
+          : > secondwave/results/browser-callbacks.log
+          while IFS= read -r -d '' report; do
+            profile="$(mktemp -d)"
+            timeout -k 5s 25s google-chrome \
+              --headless=new --no-sandbox --disable-gpu \
+              --disable-background-networking --disable-component-update \
+              --disable-sync --user-data-dir="$profile" \
+              --virtual-time-budget=8000 \
+              "file://$PWD/$report" \
+              >/dev/null 2>>secondwave/results/chromium.stderr || true
+            rm -rf "$profile"
+          done < <(find secondwave/work/out -type f \
+            \( -iname '*.html' -o -iname '*.htm' \) -print0)
+          sleep 2
+
+      - name: Analyze all outputs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 agent8-secondwave/analyze.py
+
+      - name: Commit compact result
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git config user.name agent8-validation-bot
+          git config user.email agent8-validation-bot@users.noreply.github.com
+          mkdir -p agent8-results
+          cp secondwave/results/analysis.md agent8-results/latest.md 2>/dev/null || true
+          cp secondwave/results/analysis.json agent8-results/latest.json 2>/dev/null || true
+          cp secondwave/results/version.txt agent8-results/version.txt 2>/dev/null || true
+          cp secondwave/results/binary-sha256.txt agent8-results/binary-sha256.txt 2>/dev/null || true
+          git add agent8-results
+          git commit -m 'test: record Agent 8 TRR second-wave results' || true
+          git push origin HEAD:agent8-mongosql-trr-secondwave-20260830 || true
+
+      - name: Upload complete evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent8-trr-secondwave-evidence
+          path: secondwave/results
+          if-no-files-found: warn
+          retention-days: 7
