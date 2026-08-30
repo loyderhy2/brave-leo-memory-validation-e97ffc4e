@@ -1,0 +1,128 @@
+name: Agent 8 Schema Manager download discovery
+
+on:
+  push:
+    branches:
+      - agent8-schema-manager-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Capture static download page
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence
+          curl --fail --location --retry 5 --retry-all-errors \
+            -A 'Mozilla/5.0' \
+            https://www.mongodb.com/try/download/sql-schema-builder \
+            -o evidence/page-static.html
+          sha256sum evidence/page-static.html > evidence/page-static.sha256
+          grep -Eo 'https?://[^"<> ]+' evidence/page-static.html | sort -u > evidence/static-urls.txt || true
+          grep -InaE 'schema-manager|schema.builder|download|translators-connectors|s3.amazonaws' evidence/page-static.html \
+            > evidence/static-interesting.txt || true
+
+      - name: Capture rendered DOM and network resources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 -m pip install --quiet selenium
+          command -v google-chrome | tee evidence/chrome-path.txt
+          google-chrome --version | tee evidence/chrome-version.txt
+
+          cat > evidence/discover.py <<'PY'
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+
+          out = Path('evidence')
+          options = Options()
+          options.binary_location = '/usr/bin/google-chrome'
+          options.add_argument('--headless=new')
+          options.add_argument('--no-sandbox')
+          options.add_argument('--disable-dev-shm-usage')
+          options.add_argument('--disable-gpu')
+          options.add_argument('--window-size=1600,1200')
+          options.add_argument('--disable-features=OptimizationHints')
+          options.set_capability('goog:loggingPrefs', {'performance': 'ALL', 'browser': 'ALL'})
+
+          driver = webdriver.Chrome(options=options)
+          try:
+              driver.get('https://www.mongodb.com/try/download/sql-schema-builder')
+              time.sleep(15)
+              out.joinpath('rendered.html').write_text(driver.page_source, encoding='utf-8')
+              out.joinpath('title.txt').write_text(driver.title, encoding='utf-8')
+              out.joinpath('current-url.txt').write_text(driver.current_url, encoding='utf-8')
+              driver.save_screenshot(str(out / 'rendered.png'))
+
+              snapshot = driver.execute_script(r'''
+                const attrs = (el) => Object.fromEntries(Array.from(el.attributes || []).map(a => [a.name, a.value]));
+                return {
+                  links: Array.from(document.querySelectorAll('a')).map(el => ({text: el.innerText, href: el.href, attrs: attrs(el)})),
+                  buttons: Array.from(document.querySelectorAll('button')).map(el => ({text: el.innerText, attrs: attrs(el), html: el.outerHTML.slice(0, 3000)})),
+                  inputs: Array.from(document.querySelectorAll('input')).map(el => ({value: el.value, attrs: attrs(el)})),
+                  selects: Array.from(document.querySelectorAll('select')).map(el => ({value: el.value, attrs: attrs(el), options: Array.from(el.options).map(o => ({text:o.text, value:o.value, selected:o.selected}))})),
+                  scripts: Array.from(document.scripts).map(el => ({src: el.src, type: el.type, text: (el.textContent || '').slice(0, 200000)})),
+                  resources: performance.getEntriesByType('resource').map(x => x.name),
+                  bodyText: document.body.innerText,
+                  localStorage: Object.fromEntries(Object.keys(localStorage).map(k => [k, localStorage.getItem(k)])),
+                  sessionStorage: Object.fromEntries(Object.keys(sessionStorage).map(k => [k, sessionStorage.getItem(k)])),
+                };
+              ''')
+              out.joinpath('dom-snapshot.json').write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding='utf-8')
+
+              logs = driver.get_log('performance')
+              out.joinpath('performance.json').write_text(json.dumps(logs, indent=2), encoding='utf-8')
+              out.joinpath('browser.json').write_text(json.dumps(driver.get_log('browser'), indent=2), encoding='utf-8')
+
+              candidates = set()
+              url_re = re.compile(r'https?://[^"\'<>\\\s]+')
+              for path in [out/'page-static.html', out/'rendered.html', out/'dom-snapshot.json', out/'performance.json']:
+                  text = path.read_text(errors='replace')
+                  for url in url_re.findall(text):
+                      decoded = url.replace('\\u002F', '/').replace('\\/', '/')
+                      if any(k in decoded.lower() for k in ('schema-manager', 'schema_builder', 'schema-builder', 'translators-connectors', 's3.amazonaws', 'download')):
+                          candidates.add(decoded)
+              out.joinpath('candidate-urls.txt').write_text('\n'.join(sorted(candidates)), encoding='utf-8')
+
+              interesting = []
+              for key in ('links', 'buttons', 'inputs', 'selects', 'resources'):
+                  for item in snapshot.get(key, []):
+                      blob = json.dumps(item, ensure_ascii=False) if not isinstance(item, str) else item
+                      if any(k in blob.lower() for k in ('schema', 'download', 'linux', 'openssl', '1.2.1', 's3')):
+                          interesting.append(f'{key}: {blob}')
+              out.joinpath('dom-interesting.txt').write_text('\n'.join(interesting), encoding='utf-8')
+          finally:
+              driver.quit()
+          PY
+
+          python3 evidence/discover.py
+
+      - name: Package discovery evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-schema-manager-download-discovery.tar.gz evidence
+          sha256sum agent8-schema-manager-download-discovery.tar.gz > agent8-schema-manager-download-discovery.tar.gz.sha256
+
+      - name: Upload discovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent8-schema-manager-download-discovery
+          path: |
+            agent8-schema-manager-download-discovery.tar.gz
+            agent8-schema-manager-download-discovery.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
