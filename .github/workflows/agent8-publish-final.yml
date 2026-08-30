@@ -1,0 +1,49 @@
+name: Publish Agent 8 MongoSQL final evidence
+
+on:
+  push:
+    branches:
+      - agent8-mongosql-final-20260830
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.actor == 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package committed final result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f agent8-final-results/FINAL_RESULT.json
+          test -f agent8-final-results/FINAL_REPORT.md
+          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-mongosql-final-evidence.tar.gz agent8-final-results
+          sha256sum agent8-mongosql-final-evidence.tar.gz > agent8-mongosql-final-evidence.tar.gz.sha256
+      - name: Publish stable public release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tag='agent8-mongosql-final-20260830'
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              agent8-mongosql-final-evidence.tar.gz \
+              agent8-mongosql-final-evidence.tar.gz.sha256 \
+              agent8-final-results/FINAL_RESULT.json \
+              agent8-final-results/FINAL_REPORT.md \
+              --clobber
+          else
+            gh release create "$tag" \
+              --target agent8-mongosql-final-20260830 \
+              --title 'Agent 8 MongoSQL final research evidence' \
+              --notes-file agent8-final-results/FINAL_REPORT.md \
+              agent8-mongosql-final-evidence.tar.gz \
+              agent8-mongosql-final-evidence.tar.gz.sha256 \
+              agent8-final-results/FINAL_RESULT.json \
+              agent8-final-results/FINAL_REPORT.md
+          fi
