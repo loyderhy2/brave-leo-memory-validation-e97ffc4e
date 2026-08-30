@@ -1,0 +1,103 @@
+name: Agent 8 TRR CSV spreadsheet validation
+
+on:
+  push:
+    branches:
+      - agent8-mongosql-trr-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  csv-spreadsheet-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Gnumeric and XLSX reader
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnumeric
+          python3 -m pip install --quiet openpyxl
+          ssconvert --version | tee ssconvert-version.txt
+
+      - name: Create exact TRR-style CSV and controls
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence
+          mv ssconvert-version.txt evidence/
+          python3 - <<'PY'
+          from pathlib import Path
+          header = b'"Collection Name","Arrays","Arrays of Arrays","Documents","Arrays of Documents","Unstable","Multiple Types"\n'
+          # Exact byte shape emitted by TRR 1.1.3 after neutralize_formula(): a quoted cell whose first byte is TAB.
+          Path('evidence/trr-style.csv').write_bytes(header + b'"\t=1+1","0","0","0","0","0","0"\n')
+          # Positive control: formula without the TRR prefix.
+          Path('evidence/raw-formula.csv').write_bytes(header + b'"=1+1","0","0","0","0","0","0"\n')
+          # Text control using apostrophe.
+          Path('evidence/apostrophe-control.csv').write_bytes(header + b'"\'=1+1","0","0","0","0","0","0"\n')
+          PY
+          for f in evidence/*.csv; do
+            echo "===== $f =====" | tee -a evidence/input-bytes.txt
+            od -An -tx1c "$f" | tee -a evidence/input-bytes.txt
+          done
+
+      - name: Import CSV with Gnumeric and inspect formulas
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for f in evidence/*.csv; do
+            stem="${f%.csv}"
+            ssconvert "$f" "$stem.gnumeric" > "$stem.ssconvert-gnumeric.stdout" 2> "$stem.ssconvert-gnumeric.stderr"
+            ssconvert "$f" "$stem.xlsx" > "$stem.ssconvert-xlsx.stdout" 2> "$stem.ssconvert-xlsx.stderr"
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from openpyxl import load_workbook
+          import gzip, re, zipfile
+
+          lines=[]
+          for path in sorted(Path('evidence').glob('*.xlsx')):
+              wb_formula=load_workbook(path, data_only=False, read_only=False)
+              wb_value=load_workbook(path, data_only=True, read_only=False)
+              cf=wb_formula.active['A2']
+              cv=wb_value.active['A2']
+              lines.append(f'{path.name}: formula_view value={cf.value!r} data_type={cf.data_type!r}; data_only={cv.value!r} type={cv.data_type!r}')
+
+          for path in sorted(Path('evidence').glob('*.gnumeric')):
+              raw=path.read_bytes()
+              try:
+                  text=gzip.decompress(raw).decode('utf-8', 'replace')
+              except Exception:
+                  text=raw.decode('utf-8', 'replace')
+              cells=[line.strip() for line in text.splitlines() if 'Col="0" Row="1"' in line or '<gnm:Content' in line]
+              lines.append(f'{path.name}: relevant_xml={cells[:8]!r}')
+              Path(str(path)+'.xml.txt').write_text(text, encoding='utf-8')
+
+          result='\n'.join(lines)+'\n'
+          Path('evidence/verdict.txt').write_text(result, encoding='utf-8')
+          print(result)
+          PY
+
+      - name: Package evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-trr-csv-spreadsheet-evidence.tar.gz evidence
+          sha256sum agent8-trr-csv-spreadsheet-evidence.tar.gz > agent8-trr-csv-spreadsheet-evidence.tar.gz.sha256
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent8-trr-csv-spreadsheet-evidence
+          path: |
+            agent8-trr-csv-spreadsheet-evidence.tar.gz
+            agent8-trr-csv-spreadsheet-evidence.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
