@@ -1,0 +1,151 @@
+name: Agent 8 TRR filename canonicalization collision
+
+on:
+  push:
+    branches:
+      - agent8-mongosql-trr-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  collision-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download official TRR 1.1.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence/bin evidence/run
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-linux \
+            -o evidence/bin/AtlasSQLReadinessReport-linux
+          chmod +x evidence/bin/AtlasSQLReadinessReport-linux
+          evidence/bin/AtlasSQLReadinessReport-linux --version | tee evidence/bin/version.txt
+          sha256sum evidence/bin/AtlasSQLReadinessReport-linux | tee evidence/bin/sha256.txt
+
+      - name: Seed colliding and negative-control database names
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker run -d --name mongo \
+            -p 127.0.0.1:27017:27017 \
+            -e MONGO_INITDB_ROOT_USERNAME=operator \
+            -e MONGO_INITDB_ROOT_PASSWORD=OPERATOR_SECRET_CANARY_8FC2 \
+            mongo:8.0 --bind_ip_all
+
+          ready=0
+          for i in $(seq 1 90); do
+            if docker exec mongo mongosh --quiet -u operator -p OPERATOR_SECRET_CANARY_8FC2 \
+              --authenticationDatabase admin --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+              ready=1; break
+            fi
+            sleep 2
+          done
+          test "$ready" = 1
+
+          cat > evidence/run/seed.js <<'JS'
+          function create(dbName, collection, marker) {
+            const d = db.getSiblingDB(dbName);
+            d.createCollection(collection);
+            d.getCollection(collection).insertOne({ marker });
+            print(`CREATED db=${JSON.stringify(dbName)} collection=${JSON.stringify(collection)} marker=${marker}`);
+          }
+
+          // sanitize_filename removes U+0001, so these two database names map to
+          // the same output filename: trrcollision.html.
+          create("trrcollision", "PLAIN_DB_COLLECTION", "PLAIN_DB_DOCUMENT_MARKER");
+          create("trr\u0001collision", "CONTROL_DB_COLLECTION", "CONTROL_DB_DOCUMENT_MARKER");
+
+          // Negative control: distinct safe database names must produce two files.
+          create("trrnegativeone", "NEGATIVE_ONE_COLLECTION", "NEGATIVE_ONE_DOCUMENT_MARKER");
+          create("trrnegativetwo", "NEGATIVE_TWO_COLLECTION", "NEGATIVE_TWO_DOCUMENT_MARKER");
+
+          printjson(db.adminCommand({listDatabases: 1, nameOnly: true}).databases.map(x => x.name).filter(x => x.startsWith('trr')));
+          JS
+
+          docker exec -i mongo mongosh --quiet -u operator -p OPERATOR_SECRET_CANARY_8FC2 \
+            --authenticationDatabase admin < evidence/run/seed.js \
+            2>&1 | tee evidence/run/seed.log
+
+      - name: Generate reports and preserve all observable effects
+        shell: bash
+        run: |
+          set -euxo pipefail
+          URI='mongodb://operator:OPERATOR_SECRET_CANARY_8FC2@127.0.0.1:27017/admin?authSource=admin&directConnection=true&readPreference=primary&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000'
+          mkdir -p evidence/run/collision/out evidence/run/negative/out
+
+          run_case() {
+            local name="$1"
+            local include="$2"
+            local dir="$GITHUB_WORKSPACE/evidence/run/$name"
+            set +e
+            evidence/bin/AtlasSQLReadinessReport-linux \
+              --uri "$URI" \
+              --output "$dir/out" \
+              --include "$include" \
+              --quiet \
+              > "$dir/stdout.txt" 2> "$dir/stderr.txt"
+            status=$?
+            set -e
+            echo "$status" > "$dir/status.txt"
+            find "$dir/out" -mindepth 1 -printf '%y %m %s %p -> %l\n' | sort > "$dir/tree.txt"
+            for zip in "$dir"/out/*.zip; do
+              [ -f "$zip" ] || continue
+              zipinfo -1 "$zip" > "$dir/zip-entries.txt" || true
+              unzip -o "$zip" -d "$dir/unpacked" > "$dir/unzip.log" 2>&1 || true
+            done
+            grep -RIna --binary-files=text -E \
+              'PLAIN_DB|CONTROL_DB|NEGATIVE_(ONE|TWO)' "$dir" \
+              > "$dir/markers.txt" || true
+          }
+
+          run_case collision 'trr*collision.*'
+          run_case negative 'trrnegative*.*'
+
+      - name: Derive collision verdict
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('evidence/run')
+          out = []
+          for case in ('collision', 'negative'):
+              d = root / case
+              out.append(f'===== {case} =====')
+              for name in ('status.txt','tree.txt','zip-entries.txt','markers.txt','stdout.txt','stderr.txt'):
+                  p = d / name
+                  out.append(f'--- {name} exists={p.exists()} size={p.stat().st_size if p.exists() else None}')
+                  if p.exists():
+                      out.append(p.read_text(errors='backslashreplace')[:30000])
+          collision_files = list((root/'collision'/'out'/'schema_analysis').glob('*.html')) if (root/'collision'/'out'/'schema_analysis').exists() else []
+          neg_files = list((root/'negative'/'out'/'schema_analysis').glob('*.html')) if (root/'negative'/'out'/'schema_analysis').exists() else []
+          out.append('COLLISION_HTML_COUNT=' + str(len(collision_files)))
+          out.append('NEGATIVE_HTML_COUNT=' + str(len(neg_files)))
+          out.append('COLLISION_FILE_NAMES=' + repr([p.name for p in collision_files]))
+          out.append('NEGATIVE_FILE_NAMES=' + repr([p.name for p in neg_files]))
+          Path('evidence/run/verdict.txt').write_text('\n'.join(out), encoding='utf-8')
+          PY
+
+          grep -RIna --binary-files=without-match 'OPERATOR_SECRET_CANARY_8FC2' \
+            evidence/run/collision/out evidence/run/negative/out \
+            > evidence/run/generated-secret-check.txt || true
+          docker logs mongo > evidence/run/mongodb.stdout 2> evidence/run/mongodb.stderr
+          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-trr-filename-collision-evidence.tar.gz evidence
+          sha256sum agent8-trr-filename-collision-evidence.tar.gz > agent8-trr-filename-collision-evidence.tar.gz.sha256
+
+      - name: Upload collision evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent8-trr-filename-collision-evidence
+          path: |
+            agent8-trr-filename-collision-evidence.tar.gz
+            agent8-trr-filename-collision-evidence.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
