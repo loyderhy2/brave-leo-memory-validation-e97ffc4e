@@ -1,0 +1,8 @@
+test> 
+test> | | | | | | | | | | | | | | 
+test> | | | | | | | | | | Uncaught ReferenceError: tojson is not defined
+test> [
+  '=1+1'
+]
+
+test> 
