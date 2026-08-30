@@ -41,7 +41,7 @@ jobs:
           cp -a bootstrap/sources/release-v2.0.10 bootstrap/bundle/sources/
           cp -a bootstrap/sources/current-main bootstrap/bundle/sources/
           cp bootstrap/rustc-version.txt bootstrap/cargo-version.txt bootstrap/bundle/
-          tar -C bootstrap -I 'zstd -19 -T0' -cf rust-mongodb-odbc-bootstrap.tar.zst bundle
+          tar -I 'zstd -10 -T0' -cf bootstrap/rust-mongodb-odbc-bootstrap.tar.zst -C bootstrap bundle
           sha256sum bootstrap/rust-mongodb-odbc-bootstrap.tar.zst | tee bootstrap/rust-mongodb-odbc-bootstrap.tar.zst.sha256
           du -h bootstrap/rust-mongodb-odbc-bootstrap.tar.zst
 
