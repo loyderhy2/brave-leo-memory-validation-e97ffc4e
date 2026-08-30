@@ -1,0 +1,277 @@
+name: Agent 8 MongoSQL TRR final matrix
+
+on:
+  push:
+    branches:
+      - agent8-mongosql-trr-20260830
+    paths:
+      - .github/workflows/agent8-mongosql-trr-final-matrix.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate-current-trr:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download current shipped TRR and historical public source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence/bin evidence/source evidence/runs evidence/sandbox
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-linux \
+            -o evidence/bin/AtlasSQLReadinessReport-linux
+          chmod +x evidence/bin/AtlasSQLReadinessReport-linux
+          sha256sum evidence/bin/AtlasSQLReadinessReport-linux | tee evidence/bin/sha256.txt
+          file evidence/bin/AtlasSQLReadinessReport-linux | tee evidence/bin/file.txt
+          (evidence/bin/AtlasSQLReadinessReport-linux --version || true) 2>&1 | tee evidence/bin/version.txt
+          (evidence/bin/AtlasSQLReadinessReport-linux --help || true) 2>&1 | tee evidence/bin/help.txt
+          strings -a evidence/bin/AtlasSQLReadinessReport-linux > evidence/bin/strings.txt
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://github.com/mongodb/mongosql/archive/a1f7118601289db83188e5fb520db52b17eeea96.tar.gz \
+            -o evidence/source/historical-mongosql.tar.gz
+          tar -xzf evidence/source/historical-mongosql.tar.gz -C evidence/source
+          find evidence/source -path '*/bic-trip/*' -type f -print | sort > evidence/source/bic-trip-files.txt
+          grep -RInaE 'File::create|OpenOptions|PathBuf|\.join\(|\.html|\.csv|href|src=|open::|xdg-open|ShellExecute|webbrowser|tracing|event!|debug!|info!|warn!|error!' \
+            evidence/source/mongosql-*/bic-trip > evidence/source/sink-grep.txt || true
+
+      - name: Start local authenticated MongoDB
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker run --detach --name agent8-mongo \
+            --publish 127.0.0.1:27017:27017 \
+            --env MONGO_INITDB_ROOT_USERNAME=trruser \
+            --env MONGO_INITDB_ROOT_PASSWORD=TRR_SECRET_CANARY_7A91FD \
+            mongo:8.0
+          ready=0
+          for attempt in $(seq 1 90); do
+            if docker exec agent8-mongo mongosh --quiet \
+              --username trruser --password TRR_SECRET_CANARY_7A91FD \
+              --authenticationDatabase admin \
+              --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = 1
+
+      - name: Seed isolated test namespaces
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > evidence/seed.js <<'JS'
+          const t = db.getSiblingDB('trrtest');
+          const cases = [
+            ['normal', {normal: 1}],
+            ['../TRR_A8_PARENT', {'../TRR_A8_FIELD_PARENT': 1}],
+            ['../../TRR_A8_GRANDPARENT', {'../../TRR_A8_FIELD_GRANDPARENT': 1}],
+            ['nested/TRR_A8_CHILD', {'nested/TRR_A8_FIELD_CHILD': 1}],
+            ['<b id=TRR_A8_HTML_COLLECTION>collection</b>', {'<i id=TRR_A8_HTML_FIELD>field</i>': 1}],
+            ['quote" onmouseover="TRR_A8_ATTR_COLLECTION', {'quote" onmouseover="TRR_A8_ATTR_FIELD': 1}],
+            ['=HYPERLINK("http://127.0.0.1:8765/TRR_A8_CSV_COLLECTION","open")', {'=HYPERLINK("http://127.0.0.1:8765/TRR_A8_CSV_FIELD","open")': 1}],
+            ['+SUM(1,1)', {'+SUM(2,2)': 1}],
+            ['-1+1', {'-2+2': 1}],
+            ['@SUM(1,1)', {'@SUM(2,2)': 1}],
+            ['javascript:TRR_A8_URL_COLLECTION', {'javascript:TRR_A8_URL_FIELD': 1}],
+            ['file:///tmp/TRR_A8_FILE_URL_COLLECTION', {'file:///tmp/TRR_A8_FILE_URL_FIELD': 1}]
+          ];
+          for (const [name, doc] of cases) {
+            try {
+              t.createCollection(name);
+              t.getCollection(name).insertOne(doc);
+              print('CREATED:' + name);
+            } catch (e) {
+              print('FAILED:' + name + ':' + e);
+            }
+          }
+          printjson(t.getCollectionNames());
+          JS
+          docker exec -i agent8-mongo mongosh --quiet \
+            --username trruser --password TRR_SECRET_CANARY_7A91FD \
+            --authenticationDatabase admin \
+            < evidence/seed.js 2>&1 | tee evidence/seed.log
+
+      - name: Execute baseline and each boundary independently
+        shell: bash
+        run: |
+          set -u
+          BIN="$GITHUB_WORKSPACE/evidence/bin/AtlasSQLReadinessReport-linux"
+          URI='mongodb://trruser:TRR_SECRET_CANARY_7A91FD@127.0.0.1:27017/?authSource=admin&readPreference=primaryPreferred&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000'
+          cd evidence/sandbox
+          printf 'PARENT_GUARD\n' > TRR_A8_PARENT_GUARD.txt
+          find . -mindepth 1 -printf '%y %p %s\n' | sort > ../tree-before.txt
+
+          run_case() {
+            name="$1"
+            include="$2"
+            mkdir -p "../runs/$name/out"
+            printf 'OUTPUT_GUARD\n' > "../runs/$name/out/TRR_A8_OUTPUT_GUARD.txt"
+            set +e
+            timeout --signal=TERM --kill-after=15s 300s "$BIN" \
+              --uri "$URI" \
+              --output "$GITHUB_WORKSPACE/evidence/runs/$name/out" \
+              --include "$include" \
+              </dev/null > "../runs/$name/stdout.txt" 2> "../runs/$name/stderr.txt"
+            code=$?
+            set -e
+            printf '%s\n' "$code" > "../runs/$name/exit-status.txt"
+            find "../runs/$name/out" -mindepth 1 -printf '%y %m %s %p -> %l\n' | sort > "../runs/$name/output-tree.txt"
+          }
+
+          run_case baseline 'trrtest.normal'
+          run_case path_parent 'trrtest.\\.\\./TRR_A8_PARENT'
+          run_case path_grandparent 'trrtest.\\.\\./\\.\\./TRR_A8_GRANDPARENT'
+          run_case path_child 'trrtest.nested/TRR_A8_CHILD'
+          run_case html_body 'trrtest.<b id=TRR_A8_HTML_COLLECTION>collection</b>'
+          run_case html_attr 'trrtest.quote" onmouseover="TRR_A8_ATTR_COLLECTION'
+          run_case csv_equal 'trrtest.=HYPERLINK("http://127.0.0.1:8765/TRR_A8_CSV_COLLECTION","open")'
+          run_case csv_plus 'trrtest.+SUM(1,1)'
+          run_case csv_minus 'trrtest.-1+1'
+          run_case csv_at 'trrtest.@SUM(1,1)'
+          run_case url_javascript 'trrtest.javascript:TRR_A8_URL_COLLECTION'
+          run_case url_file 'trrtest.file:///tmp/TRR_A8_FILE_URL_COLLECTION'
+
+          # Invalid-origin diagnostic path: deterministic fast failure with a credential canary.
+          mkdir -p ../runs/diagnostic/out
+          set +e
+          timeout 30s "$BIN" \
+            --uri 'mongodb://TRR_A8_USER:TRR_SECRET_CANARY_7A91FD@127.0.0.1:1/?authSource=admin&serverSelectionTimeoutMS=1000&connectTimeoutMS=1000' \
+            --output "$GITHUB_WORKSPACE/evidence/runs/diagnostic/out" \
+            --include 'trrtest.normal' </dev/null \
+            > ../runs/diagnostic/stdout.txt 2> ../runs/diagnostic/stderr.txt
+          printf '%s\n' "$?" > ../runs/diagnostic/exit-status.txt
+          set -e
+
+          find "$GITHUB_WORKSPACE/evidence" -mindepth 1 -printf '%y %m %s %p -> %l\n' | sort > ../tree-after.txt
+          diff -u ../tree-before.txt ../tree-after.txt > ../tree.diff || true
+
+      - name: Analyze outputs and write final verdict
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import csv, html, json, os, re
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          root = Path('evidence')
+          runs = root/'runs'
+          canary = 'TRR_SECRET_CANARY_7A91FD'
+          expected_root = runs.resolve()
+          verdict = {
+            'binary_version': (root/'bin/version.txt').read_text(errors='replace').strip(),
+            'cases': {},
+            'path_escape': [],
+            'secret_leak': [],
+            'raw_html': [],
+            'unsafe_href': [],
+            'dangerous_csv': [],
+            'neutralized_csv': [],
+          }
+
+          def text(p):
+            try: return p.read_text(encoding='utf-8', errors='replace')
+            except Exception: return ''
+
+          for case in sorted(p for p in runs.iterdir() if p.is_dir()):
+            code = None
+            ep = case/'exit-status.txt'
+            if ep.exists():
+              try: code = int(ep.read_text().strip())
+              except: pass
+            out = case/'out'
+            files = [p for p in out.rglob('*') if p.is_file()] if out.exists() else []
+            verdict['cases'][case.name] = {
+              'exit': code,
+              'files': [str(p.relative_to(out)) for p in files],
+              'stdout': text(case/'stdout.txt')[:5000],
+              'stderr': text(case/'stderr.txt')[:10000],
+            }
+            for p in [case/'stdout.txt', case/'stderr.txt'] + files:
+              t = text(p)
+              if canary in t:
+                verdict['secret_leak'].append(str(p))
+              if p.suffix.lower() in {'.html','.htm'}:
+                if re.search(r'<(?:b|i|svg)[^>]*TRR_A8_', t, re.I):
+                  verdict['raw_html'].append(str(p))
+                for m in re.finditer(r'''(?is)\bhref\s*=\s*(["'])(.*?)\1''', t):
+                  href=html.unescape(m.group(2).strip())
+                  scheme=urlparse(href).scheme.lower()
+                  if scheme and scheme not in {'http','https','file'}:
+                    verdict['unsafe_href'].append({'file':str(p),'href':href})
+              if p.suffix.lower()=='.csv':
+                try:
+                  with p.open(encoding='utf-8-sig',errors='replace',newline='') as fh:
+                    for ri,row in enumerate(csv.reader(fh),1):
+                      for ci,cell in enumerate(row,1):
+                        if 'TRR_A8_' in cell or 'SUM(' in cell:
+                          s=cell.lstrip('\ufeff')
+                          item={'file':str(p),'row':ri,'column':ci,'cell':cell[:500]}
+                          if s.startswith(('=','+','-','@')):
+                            verdict['dangerous_csv'].append(item)
+                          elif s.startswith(("'",'\t',' ')):
+                            verdict['neutralized_csv'].append(item)
+
+          # Files created outside the requested per-case out directories but carrying path markers.
+          for p in root.rglob('*'):
+            if not p.is_file() or 'TRR_A8_' not in p.name:
+              continue
+            if p.name.endswith('GUARD.txt') or p.name in {'seed.js','seed.log'}:
+              continue
+            if '/out/' not in str(p).replace('\\','/'):
+              verdict['path_escape'].append(str(p))
+
+          confirmed=[]
+          if verdict['path_escape']: confirmed.append('path-traversal')
+          if verdict['secret_leak']: confirmed.append('credential-disclosure')
+          if verdict['raw_html']: confirmed.append('raw-html')
+          if verdict['unsafe_href']: confirmed.append('unsafe-url')
+          if verdict['dangerous_csv']: confirmed.append('csv-formula')
+          verdict['confirmed_signals']=confirmed
+          Path('evidence/FINAL_VERDICT.json').write_text(json.dumps(verdict,indent=2,ensure_ascii=False))
+
+          md=['# Agent 8 final runtime matrix','',f"Binary: `{verdict['binary_version']}`",'',
+              f"Confirmed machine signals: **{', '.join(confirmed) if confirmed else 'none'}**",'',
+              '## Independent cases','']
+          for name,c in verdict['cases'].items():
+            md += [f"### {name}",f"- exit: `{c['exit']}`",f"- files: `{len(c['files'])}`"]
+            for f in c['files'][:30]: md.append(f"- `{f}`")
+            if c['stderr']:
+              md += ['','```text',c['stderr'][:3000],'```']
+          for key in ['path_escape','secret_leak','raw_html','unsafe_href','dangerous_csv','neutralized_csv']:
+            md += ['',f"## {key}",'', '```json',json.dumps(verdict[key],indent=2,ensure_ascii=False)[:20000],'```']
+          Path('evidence/FINAL_VERDICT.md').write_text('\n'.join(md))
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+            f.write('VERDICT_CLASS=' + ('signals-' + '-'.join(confirmed) if confirmed else 'no-machine-signal') + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+            f.write('\n'.join(md[:80]))
+          PY
+
+      - name: Package evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          docker logs agent8-mongo > evidence/mongodb.stdout.txt 2> evidence/mongodb.stderr.txt
+          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-mongosql-trr-final-matrix.tar.gz evidence
+          sha256sum agent8-mongosql-trr-final-matrix.tar.gz > agent8-mongosql-trr-final-matrix.tar.gz.sha256
+
+      - name: Upload final matrix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent8-final-${{ env.VERDICT_CLASS }}
+          path: |
+            agent8-mongosql-trr-final-matrix.tar.gz
+            agent8-mongosql-trr-final-matrix.tar.gz.sha256
+            evidence/FINAL_VERDICT.md
+            evidence/FINAL_VERDICT.json
+          if-no-files-found: warn
+          retention-days: 10
