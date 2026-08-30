@@ -11,7 +11,7 @@ permissions:
 jobs:
   validate-trr:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 12
     steps:
       - name: Check out validation branch
         uses: actions/checkout@v4
@@ -42,15 +42,18 @@ jobs:
             --env MONGO_INITDB_ROOT_PASSWORD=TRR_SECRET_CANARY_7A91FD \
             mongo:8.0
 
+          ready=0
           for attempt in $(seq 1 60); do
             if docker exec agent8-mongo mongosh --quiet \
               --username trruser --password TRR_SECRET_CANARY_7A91FD \
               --authenticationDatabase admin \
               --eval 'db.adminCommand({ ping: 1 })' >/dev/null 2>&1; then
+              ready=1
               break
             fi
             sleep 2
           done
+          test "$ready" = 1
 
           cat > evidence/run/seed.js <<'JAVASCRIPT'
           const target = db.getSiblingDB("trrtest");
@@ -106,11 +109,12 @@ jobs:
           find .. -mindepth 1 -printf 'BEFORE %y %p\n' | sort > ../tree-before.txt
 
           set +e
-          ../../bin/AtlasSQLReadinessReport-linux \
-            --uri 'mongodb://trruser:TRR_SECRET_CANARY_7A91FD@127.0.0.1:27017/admin?authSource=admin' \
-            --output "$PWD/out" \
-            --include 'trrtest.*' \
-            > ../stdout.txt 2> ../stderr.txt
+          timeout --signal=TERM --kill-after=10s 120s \
+            ../../bin/AtlasSQLReadinessReport-linux \
+              --uri 'mongodb://trruser:TRR_SECRET_CANARY_7A91FD@127.0.0.1:27017/admin?authSource=admin' \
+              --output "$PWD/out" \
+              --include 'trrtest.*' \
+              </dev/null > ../stdout.txt 2> ../stderr.txt
           status=$?
           set -e
           printf '%s\n' "$status" > ../exit-status.txt
