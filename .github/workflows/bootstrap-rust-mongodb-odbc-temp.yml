@@ -1,0 +1,56 @@
+name: Temporary Rust and MongoDB ODBC Build Bootstrap
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/mongodb-odbc-bootstrap/**
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare public source and dependency cache
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p bootstrap/sources
+          git clone --branch v2.0.10 --single-branch https://github.com/mongodb/mongo-odbc-driver.git bootstrap/sources/release-v2.0.10
+          git clone --branch main --single-branch https://github.com/mongodb/mongo-odbc-driver.git bootstrap/sources/current-main
+          rustc --version --verbose | tee bootstrap/rustc-version.txt
+          cargo --version --verbose | tee bootstrap/cargo-version.txt
+          (cd bootstrap/sources/release-v2.0.10 && cargo fetch --locked)
+          (cd bootstrap/sources/current-main && cargo fetch --locked)
+
+      - name: Package self-contained toolchain and Cargo cache
+        shell: bash
+        run: |
+          set -euxo pipefail
+          SYSROOT="$(rustc --print sysroot)"
+          mkdir -p bootstrap/bundle/toolchain bootstrap/bundle/cargo-home bootstrap/bundle/sources
+          cp -a "$SYSROOT/." bootstrap/bundle/toolchain/
+          cp -a "$HOME/.cargo/registry" bootstrap/bundle/cargo-home/registry
+          if [ -d "$HOME/.cargo/git" ]; then cp -a "$HOME/.cargo/git" bootstrap/bundle/cargo-home/git; fi
+          cp -a bootstrap/sources/release-v2.0.10 bootstrap/bundle/sources/
+          cp -a bootstrap/sources/current-main bootstrap/bundle/sources/
+          cp bootstrap/rustc-version.txt bootstrap/cargo-version.txt bootstrap/bundle/
+          tar -C bootstrap -I 'zstd -19 -T0' -cf rust-mongodb-odbc-bootstrap.tar.zst bundle
+          sha256sum bootstrap/rust-mongodb-odbc-bootstrap.tar.zst | tee bootstrap/rust-mongodb-odbc-bootstrap.tar.zst.sha256
+          du -h bootstrap/rust-mongodb-odbc-bootstrap.tar.zst
+
+      - name: Upload bootstrap bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-mongodb-odbc-bootstrap
+          path: |
+            bootstrap/rust-mongodb-odbc-bootstrap.tar.zst
+            bootstrap/rust-mongodb-odbc-bootstrap.tar.zst.sha256
+          if-no-files-found: error
+          retention-days: 1
