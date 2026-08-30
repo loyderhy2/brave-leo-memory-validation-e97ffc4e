@@ -1,0 +1,242 @@
+name: Agent 8 Schema Manager terminal proof v2
+
+on:
+  push:
+    branches:
+      - agent8-schema-manager-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies and download shipped binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xterm x11-utils xclip xvfb kitty
+          mkdir -p evidence/bin evidence/run enterprise
+          xterm -version 2>&1 | tee evidence/run/xterm-version.txt || true
+          kitty --version | tee evidence/run/kitty-version.txt
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://downloads.mongodb.org/mongodb-schema-manager/x86_64/linux/openssl3/mongodb-schema-manager-v1.2.1 \
+            -o evidence/bin/mongodb-schema-manager
+          chmod +x evidence/bin/mongodb-schema-manager
+          sha256sum evidence/bin/mongodb-schema-manager | tee evidence/bin/schema-manager.sha256
+          file evidence/bin/mongodb-schema-manager | tee evidence/bin/schema-manager.file
+          evidence/bin/mongodb-schema-manager --version 2>&1 | tee evidence/bin/schema-manager.version
+          evidence/bin/mongodb-schema-manager --help 2>&1 | tee evidence/bin/schema-manager.help
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://downloads.mongodb.com/linux/mongodb-linux-x86_64-enterprise-ubuntu2404-8.0.29.tgz \
+            -o enterprise/mongodb-enterprise.tgz
+          sha256sum enterprise/mongodb-enterprise.tgz | tee evidence/bin/mongodb-enterprise.sha256
+          tar -xzf enterprise/mongodb-enterprise.tgz -C enterprise
+          MONGOD=$(find enterprise -type f -path '*/bin/mongod' -print -quit)
+          test -n "$MONGOD"
+          echo "$MONGOD" > evidence/bin/mongod.path
+          "$MONGOD" --version | tee evidence/bin/mongod.version
+
+      - name: Start Enterprise server and create separate attacker and operator identities
+        shell: bash
+        run: |
+          set -euxo pipefail
+          MONGOD=$(cat evidence/bin/mongod.path)
+          mkdir -p evidence/run/db evidence/run/logs
+          "$MONGOD" --dbpath "$GITHUB_WORKSPACE/evidence/run/db" \
+            --bind_ip 127.0.0.1 --port 27017 --auth --fork \
+            --logpath "$GITHUB_WORKSPACE/evidence/run/logs/mongod.log"
+
+          ready=0
+          for i in $(seq 1 120); do
+            if docker run --rm --network host mongo:8.0 \
+              mongosh --quiet --host 127.0.0.1 --port 27017 \
+              --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+              ready=1; break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1
+
+          docker run --rm --network host mongo:8.0 \
+            mongosh --quiet --host 127.0.0.1 --port 27017 \
+            --eval 'db.getSiblingDB("admin").createUser({user:"root",pwd:"ROOT_SETUP_SECRET_4A91",roles:["root"]})' \
+            | tee evidence/run/create-root.log
+
+          cat > evidence/run/create-users.js <<'JS'
+          for (const name of ["schemaneg", "schemaosc", "schemaclip"]) {
+            db.getSiblingDB(name).createUser({
+              user: "attacker",
+              pwd: "ATTACKER_PASSWORD_NOT_SECRET",
+              roles: [{ role: "readWrite", db: name }]
+            });
+            db.getSiblingDB(name).createUser({
+              user: "schema_operator",
+              pwd: "SCHEMA_OPERATOR_SECRET_8B21",
+              roles: [{ role: "readWrite", db: name }]
+            });
+          }
+          JS
+          docker run --rm --network host -i mongo:8.0 \
+            mongosh --quiet --host 127.0.0.1 --port 27017 \
+            -u root -p ROOT_SETUP_SECRET_4A91 --authenticationDatabase admin \
+            < evidence/run/create-users.js 2>&1 | tee evidence/run/create-users.log
+
+          docker run --rm --network host mongo:8.0 \
+            mongosh --quiet --host 127.0.0.1 --port 27017 \
+            -u attacker -p ATTACKER_PASSWORD_NOT_SECRET --authenticationDatabase schemaneg \
+            --eval 'const d=db.getSiblingDB("schemaneg"); d.createCollection("normal_collection"); d.normal_collection.insertOne({value:1}); printjson(d.getCollectionNames())' \
+            2>&1 | tee evidence/run/seed-negative.log
+
+          docker run --rm --network host mongo:8.0 \
+            mongosh --quiet --host 127.0.0.1 --port 27017 \
+            -u attacker -p ATTACKER_PASSWORD_NOT_SECRET --authenticationDatabase schemaosc \
+            --eval 'const d=db.getSiblingDB("schemaosc"); const n="\u001b]0;SCHEMA_OSC_OK\u0007"; d.createCollection(n); d.getCollection(n).insertOne({value:1}); printjson(d.getCollectionNames())' \
+            2>&1 | tee evidence/run/seed-osc.log
+
+          docker run --rm --network host mongo:8.0 \
+            mongosh --quiet --host 127.0.0.1 --port 27017 \
+            -u attacker -p ATTACKER_PASSWORD_NOT_SECRET --authenticationDatabase schemaclip \
+            --eval 'const d=db.getSiblingDB("schemaclip"); const n="\u001b]52;c;U0NIRU1BX0NMSVBfT0s=\u0007"; d.createCollection(n); d.getCollection(n).insertOne({value:1}); printjson(d.getCollectionNames())' \
+            2>&1 | tee evidence/run/seed-clipboard.log
+
+          docker run --rm --network host mongo:8.0 \
+            mongosh --quiet --host 127.0.0.1 --port 27017 \
+            -u root -p ROOT_SETUP_SECRET_4A91 --authenticationDatabase admin \
+            --eval 'for (const n of ["schemaneg","schemaosc","schemaclip"]) print(n+":"+JSON.stringify(db.getSiblingDB(n).getCollectionNames())); printjson(db.adminCommand({buildInfo:1}).modules)' \
+            2>&1 | tee evidence/run/seed-verification.log
+
+      - name: Execute default and quiet cases in real terminals
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export DISPLAY=:99 KITTY_DISABLE_WAYLAND=1
+          Xvfb :99 -screen 0 1280x800x24 > evidence/run/xvfb.log 2>&1 &
+          XVFB_PID=$!
+          sleep 2
+          BIN="$GITHUB_WORKSPACE/evidence/bin/mongodb-schema-manager"
+
+          uri() {
+            local db="$1"
+            printf 'mongodb://schema_operator:SCHEMA_OPERATOR_SECRET_8B21@127.0.0.1:27017/%s?authSource=%s&directConnection=true&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000' "$db" "$db"
+          }
+          find_window() {
+            local title="$1"
+            for i in $(seq 1 120); do
+              wid=$(xwininfo -root -tree 2>/dev/null | awk -v t="$title" 'index($0,t){print $1; exit}')
+              if [ -n "${wid:-}" ]; then printf '%s' "$wid"; return 0; fi
+              sleep 0.1
+            done
+            return 1
+          }
+          run_xterm() {
+            local name="$1" db="$2" initial="$3"
+            local out="$GITHUB_WORKSPACE/evidence/run/$name" start="/tmp/$name.start" done="/tmp/$name.done"
+            local u; u=$(uri "$db")
+            mkdir -p "$out"; rm -f "$start" "$done"
+            cat > "$out/run.sh" <<SH
+          #!/usr/bin/env bash
+          while [ ! -e '$start' ]; do sleep 0.05; done
+          set +e
+          script -q -e -c "'$BIN' --uri '$u' --ns-include '$db.*' --jobs 1 --action overwrite" '$out/typescript.bin'
+          echo \$? > '$out/status.txt'; touch '$done'; sleep 10
+          SH
+            chmod +x "$out/run.sh"
+            xterm -geometry 160x40 -T "$initial" -e "$out/run.sh" > "$out/xterm.stdout" 2> "$out/xterm.stderr" &
+            local pid=$! wid; wid=$(find_window "$initial")
+            xprop -id "$wid" WM_NAME _NET_WM_NAME > "$out/title.before.txt" 2>&1 || true
+            touch "$start"
+            for i in $(seq 1 600); do
+              xprop -id "$wid" WM_NAME _NET_WM_NAME >> "$out/title.poll.txt" 2>&1 || true
+              if [ -e "$done" ]; then sleep 1; xprop -id "$wid" WM_NAME _NET_WM_NAME > "$out/title.after.txt" 2>&1 || true; break; fi
+              sleep 0.1
+            done
+            kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true
+          }
+          run_kitty() {
+            local name="$1" db="$2" initial="$3" extra="${4:-}"
+            local out="$GITHUB_WORKSPACE/evidence/run/$name" done="/tmp/$name.done"
+            local u; u=$(uri "$db")
+            mkdir -p "$out"; rm -f "$done"
+            printf '%s' "$initial" | xclip -selection clipboard
+            echo "before=$(xclip -o -selection clipboard 2>/dev/null || true)" > "$out/clipboard.txt"
+            cat > "$out/run.sh" <<SH
+          #!/usr/bin/env bash
+          set +e
+          script -q -e -c "'$BIN' --uri '$u' --ns-include '$db.*' --jobs 1 --action overwrite $extra" '$out/typescript.bin'
+          echo \$? > '$out/status.txt'; touch '$done'; sleep 8
+          SH
+            chmod +x "$out/run.sh"
+            kitty --config NONE --class "agent8-$name" --title "AGENT8_$name" "$out/run.sh" > "$out/kitty.stdout" 2> "$out/kitty.stderr" &
+            local pid=$!
+            for i in $(seq 1 700); do if [ -e "$done" ]; then sleep 1; break; fi; sleep 0.1; done
+            echo "after=$(xclip -o -selection clipboard 2>/dev/null || true)" >> "$out/clipboard.txt"
+            kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true
+          }
+
+          run_xterm negative schemaneg SCHEMA_NEGATIVE_INITIAL
+          run_xterm osc schemaosc SCHEMA_OSC_INITIAL
+          run_kitty clipboard schemaclip SCHEMA_CLIP_INITIAL_DEFAULT
+          run_kitty clipboard-quiet schemaclip SCHEMA_CLIP_INITIAL_QUIET '--quiet'
+          kill "$XVFB_PID" >/dev/null 2>&1 || true; wait "$XVFB_PID" >/dev/null 2>&1 || true
+
+      - name: Analyze and package evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p evidence/run/negative evidence/run/osc evidence/run/clipboard evidence/run/clipboard-quiet
+          for case in negative osc clipboard clipboard-quiet; do
+            grep -aob 'SCHEMA_OSC_OK\|SCHEMA_CLIP_OK' "evidence/run/$case/typescript.bin" > "evidence/run/$case/marker-offsets.txt" || true
+            xxd -g1 "evidence/run/$case/typescript.bin" > "evidence/run/$case/typescript.hex" 2>/dev/null || true
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          r=Path('evidence/run')
+          def txt(p):
+              q=r/p
+              return q.read_text(errors='backslashreplace') if q.exists() else '<MISSING>'
+          values={
+            'NEGATIVE_TITLE':txt('negative/title.after.txt'),
+            'OSC_TITLE':txt('osc/title.after.txt'),
+            'DEFAULT_CLIPBOARD':txt('clipboard/clipboard.txt'),
+            'QUIET_CLIPBOARD':txt('clipboard-quiet/clipboard.txt'),
+          }
+          out=[f'{k}={v!r}' for k,v in values.items()]
+          out += [
+            'NEGATIVE_RETAINED='+str('SCHEMA_NEGATIVE_INITIAL' in values['NEGATIVE_TITLE']),
+            'OSC_TITLE_CHANGED='+str('SCHEMA_OSC_OK' in values['OSC_TITLE']),
+            'DEFAULT_CLIPBOARD_CHANGED='+str('after=SCHEMA_CLIP_OK' in values['DEFAULT_CLIPBOARD']),
+            'QUIET_CLIPBOARD_RETAINED='+str('after=SCHEMA_CLIP_INITIAL_QUIET' in values['QUIET_CLIPBOARD']),
+          ]
+          for c in ('negative','osc','clipboard','clipboard-quiet'):
+              raw=(r/c/'typescript.bin').read_bytes() if (r/c/'typescript.bin').exists() else b''
+              out.append(c.upper()+'_STATUS='+txt(f'{c}/status.txt').strip())
+              out.append(c.upper()+'_RAW_OSC_PRESENT='+str(b'\x1b]' in raw))
+          (r/'verdict.txt').write_text('\n'.join(out),encoding='utf-8')
+          PY
+          grep -RIna --binary-files=without-match 'SCHEMA_OPERATOR_SECRET_8B21' \
+            evidence/run/negative evidence/run/osc evidence/run/clipboard evidence/run/clipboard-quiet \
+            > evidence/run/tool-secret-check.txt || true
+          tar --sort=name --mtime='UTC 2026-08-30' --exclude='evidence/run/db' \
+            -czf agent8-schema-manager-terminal-proof-v2.tar.gz evidence
+          sha256sum agent8-schema-manager-terminal-proof-v2.tar.gz > agent8-schema-manager-terminal-proof-v2.tar.gz.sha256
+
+      - name: Upload proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent8-schema-manager-terminal-proof-v2
+          path: |
+            agent8-schema-manager-terminal-proof-v2.tar.gz
+            agent8-schema-manager-terminal-proof-v2.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
