@@ -1,0 +1,423 @@
+name: Temporary Kiwi auth encrypted single-account lifecycle v2
+
+on:
+  issues:
+    types:
+      - opened
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  validate:
+    if: >-
+      github.event.issue.title == '[SECURITY-RESEARCH] Run Kiwi auth lifecycle v2' &&
+      github.event.issue.user.login == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Receive encrypted controlled address and request one OTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/kiwi-auth /tmp/kiwi-evidence
+
+          challenge=$(openssl rand -hex 16)
+          printf '%s' "$challenge" > /tmp/kiwi-auth/challenge
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out /tmp/kiwi-auth/private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/kiwi-auth/private.pem -pubout \
+            -out /tmp/kiwi-auth/public.pem >/dev/null 2>&1
+          public_key_b64=$(base64 -w0 /tmp/kiwi-auth/public.pem)
+
+          cat > /tmp/kiwi-auth/channel.md <<EOF
+          KIWI_ACCOUNT_ENCRYPTION_V1
+
+          challenge: ${challenge}
+          public_key_base64: ${public_key_b64}
+          EOF
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+            --body-file /tmp/kiwi-auth/channel.md >/dev/null
+
+          ciphertext=''
+          for _ in $(seq 1 180); do
+            issue_body=$(gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+              --json body --jq '.body')
+            case "$issue_body" in
+              KIWI_ACCOUNT_CIPHERTEXT_V1:*)
+                ciphertext=${issue_body#KIWI_ACCOUNT_CIPHERTEXT_V1:}
+                break
+                ;;
+            esac
+            sleep 3
+          done
+          if [[ -z "$ciphertext" ]]; then
+            echo 'Encrypted controlled address was not received' >&2
+            exit 1
+          fi
+
+          printf '%s' "$ciphertext" | base64 -d > /tmp/kiwi-auth/account.bin
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/kiwi-auth/private.pem \
+            -in /tmp/kiwi-auth/account.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -out /tmp/kiwi-auth/account.json
+
+          CHALLENGE="$challenge" python3 <<'PY'
+          import json, os, re
+          from pathlib import Path
+          data = json.loads(Path('/tmp/kiwi-auth/account.json').read_text(encoding='utf-8'))
+          if data.get('challenge') != os.environ['CHALLENGE']:
+              raise SystemExit('Encrypted account challenge mismatch')
+          email = str(data.get('email', '')).strip().lower()
+          if not re.fullmatch(r'[a-z0-9._%+\-]+@gmail\.com', email):
+              raise SystemExit('Controlled account address did not match the permitted Gmail shape')
+          Path('/tmp/kiwi-auth/email').write_text(email, encoding='utf-8')
+          PY
+
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+            --body 'Encrypted account address consumed and redacted; requesting one OTP.' >/dev/null
+          rm -f /tmp/kiwi-auth/account.bin /tmp/kiwi-auth/account.json
+
+          python3 <<'PY'
+          import base64, hashlib, json, urllib.error, urllib.request
+          from pathlib import Path
+
+          email = Path('/tmp/kiwi-auth/email').read_text(encoding='utf-8')
+          public_client = 'Basic ' + base64.b64encode(
+              b'frontend:WoPHu5saC6H8yUU3lnaqPWFbKT'
+          ).decode()
+          payload = json.dumps({'email': email, 'brand': 'kiwicom'}).encode()
+          request = urllib.request.Request(
+              'https://auth.skypicker.com/v2/user/otp/request',
+              data=payload,
+              method='POST',
+              headers={
+                  'Authorization': public_client,
+                  'Origin': 'https://www.kiwi.com',
+                  'Referer': 'https://www.kiwi.com/',
+                  'Content-Type': 'application/json',
+                  'Accept': 'application/json',
+                  'User-Agent': 'Mozilla/5.0 Chrome/140.0',
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  status = response.status
+                  raw = response.read()
+          except urllib.error.HTTPError as error:
+              status = error.code
+              raw = error.read()
+          if status != 200:
+              raise SystemExit(f'OTP initiation returned HTTP {status}')
+          data = json.loads(raw)
+          transaction_id = data.get('transaction_id')
+          if not isinstance(transaction_id, str) or not transaction_id:
+              raise SystemExit('OTP initiation did not return a transaction ID')
+          Path('/tmp/kiwi-auth/transaction_id').write_text(transaction_id, encoding='utf-8')
+          Path('/tmp/kiwi-evidence/init.json').write_text(json.dumps({
+              'status': status,
+              'controlled_email_sha256': hashlib.sha256(email.encode()).hexdigest(),
+              'transaction_id_sha256': hashlib.sha256(transaction_id.encode()).hexdigest(),
+              'request_count': 1,
+          }, indent=2), encoding='utf-8')
+          PY
+          rm -f /tmp/kiwi-auth/email
+
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+            --body 'KIWI_OTP_REQUESTED_V1' >/dev/null
+
+      - name: Receive and consume encrypted OTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          challenge=$(cat /tmp/kiwi-auth/challenge)
+          ciphertext=''
+          for _ in $(seq 1 180); do
+            issue_body=$(gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+              --json body --jq '.body')
+            case "$issue_body" in
+              KIWI_OTP_CIPHERTEXT_V1:*)
+                ciphertext=${issue_body#KIWI_OTP_CIPHERTEXT_V1:}
+                break
+                ;;
+            esac
+            sleep 3
+          done
+          if [[ -z "$ciphertext" ]]; then
+            echo 'Encrypted OTP was not received' >&2
+            exit 1
+          fi
+
+          printf '%s' "$ciphertext" | base64 -d > /tmp/kiwi-auth/otp.bin
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/kiwi-auth/private.pem \
+            -in /tmp/kiwi-auth/otp.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -out /tmp/kiwi-auth/otp.json
+
+          CHALLENGE="$challenge" python3 <<'PY'
+          import json, os, re
+          from pathlib import Path
+          data = json.loads(Path('/tmp/kiwi-auth/otp.json').read_text(encoding='utf-8'))
+          if data.get('challenge') != os.environ['CHALLENGE']:
+              raise SystemExit('Encrypted OTP challenge mismatch')
+          otp = str(data.get('otp', '')).strip()
+          if not re.fullmatch(r'[0-9]{6,10}', otp):
+              raise SystemExit('Encrypted payload did not contain a valid OTP shape')
+          Path('/tmp/kiwi-auth/otp').write_text(otp, encoding='utf-8')
+          PY
+
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+            --body 'Encrypted single-use OTP consumed and redacted.' >/dev/null
+          rm -f /tmp/kiwi-auth/otp.bin /tmp/kiwi-auth/otp.json \
+            /tmp/kiwi-auth/public.pem /tmp/kiwi-auth/channel.md
+
+      - name: Run bounded lifecycle controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from __future__ import annotations
+
+          import base64
+          import hashlib
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          from typing import Any
+
+          ROOT = 'https://auth.skypicker.com'
+          BASIC = 'Basic ' + base64.b64encode(
+              b'frontend:WoPHu5saC6H8yUU3lnaqPWFbKT'
+          ).decode()
+          transaction_id = Path('/tmp/kiwi-auth/transaction_id').read_text(encoding='utf-8')
+          otp = Path('/tmp/kiwi-auth/otp').read_text(encoding='utf-8')
+          last_request = 0.0
+          observations: list[dict[str, Any]] = []
+
+          def pace() -> None:
+              global last_request
+              remaining = 1.0 - (time.monotonic() - last_request)
+              if remaining > 0:
+                  time.sleep(remaining)
+              last_request = time.monotonic()
+
+          def safe_body(raw: bytes) -> dict[str, Any]:
+              digest = hashlib.sha256(raw).hexdigest()
+              try:
+                  data = json.loads(raw)
+              except Exception:
+                  return {'body_sha256': digest, 'body_bytes': len(raw)}
+              if not isinstance(data, dict):
+                  return {'body_sha256': digest, 'json_type': type(data).__name__}
+              result: dict[str, Any] = {
+                  'body_sha256': digest,
+                  'json_keys': sorted(data.keys()),
+              }
+              for key in ('status', 'title', 'detail', 'type', 'error', 'message'):
+                  value = data.get(key)
+                  if isinstance(value, (str, int, float, bool)) or value is None:
+                      result[key] = value
+              return result
+
+          def call(label: str, path: str, *, payload: dict[str, Any] | None = None,
+                   bearer: str | None = None, basic: bool = False) -> tuple[int, bytes]:
+              pace()
+              headers = {
+                  'Origin': 'https://www.kiwi.com',
+                  'Referer': 'https://www.kiwi.com/',
+                  'Content-Type': 'application/json',
+                  'Accept': 'application/json',
+                  'User-Agent': 'Mozilla/5.0 Chrome/140.0',
+              }
+              if bearer is not None:
+                  headers['Authorization'] = 'Bearer ' + bearer
+              elif basic:
+                  headers['Authorization'] = BASIC
+              body = json.dumps(payload or {}, separators=(',', ':')).encode()
+              request = urllib.request.Request(ROOT + path, data=body, method='POST', headers=headers)
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      status = response.status
+                      raw = response.read()
+              except urllib.error.HTTPError as error:
+                  status = error.code
+                  raw = error.read()
+              observations.append({'label': label, 'status': status, **safe_body(raw)})
+              return status, raw
+
+          def tokens(raw: bytes) -> tuple[str, str]:
+              data = json.loads(raw)
+              token = data.get('token') if isinstance(data, dict) else None
+              if isinstance(token, dict):
+                  access = token.get('access_token') or token.get('accessToken')
+                  refresh = token.get('refresh_token') or token.get('refreshToken')
+              else:
+                  access = data.get('access_token') if isinstance(data, dict) else None
+                  refresh = data.get('refresh_token') if isinstance(data, dict) else None
+              if not isinstance(access, str) or not isinstance(refresh, str):
+                  raise RuntimeError('Expected access and refresh tokens')
+              return access, refresh
+
+          def token_meta(value: str) -> dict[str, Any]:
+              result: dict[str, Any] = {
+                  'sha256': hashlib.sha256(value.encode()).hexdigest(),
+                  'length': len(value),
+              }
+              parts = value.split('.')
+              if len(parts) != 3:
+                  return result
+              try:
+                  def decode(part: str) -> Any:
+                      return json.loads(base64.urlsafe_b64decode(part + '=' * (-len(part) % 4)))
+                  header = decode(parts[0])
+                  claims = decode(parts[1])
+                  if isinstance(header, dict):
+                      result['alg'] = header.get('alg')
+                  if isinstance(claims, dict):
+                      for key in ('iat', 'nbf', 'exp'):
+                          if isinstance(claims.get(key), (int, float)):
+                              result[key] = claims[key]
+                      if isinstance(claims.get('sub'), str):
+                          result['sub_sha256'] = hashlib.sha256(claims['sub'].encode()).hexdigest()
+              except Exception:
+                  result['decode_error'] = True
+              return result
+
+          report: dict[str, Any] = {}
+          call('negative_invalid_refresh', '/v2/token/refresh',
+               payload={'refresh_token': 'synthetic-invalid-refresh'}, basic=True)
+          call('negative_invalid_access_oracle', '/v2/oidc/login',
+               bearer='synthetic-invalid-access', payload={})
+
+          login_status, login_raw = call(
+              'control_otp_login', '/v2/user/otp/login',
+              payload={'transaction_id': transaction_id, 'otp_code': otp}, basic=True,
+          )
+          if login_status != 200:
+              raise SystemExit(f'OTP login failed with HTTP {login_status}')
+          access0, refresh0 = tokens(login_raw)
+          report['access0'] = token_meta(access0)
+          report['refresh0'] = token_meta(refresh0)
+
+          replay_status, replay_raw = call(
+              'attack_otp_transaction_replay', '/v2/user/otp/login',
+              payload={'transaction_id': transaction_id, 'otp_code': otp}, basic=True,
+          )
+          if replay_status == 200:
+              replay_access, replay_refresh = tokens(replay_raw)
+              report['otp_replay_tokens'] = {
+                  'access': token_meta(replay_access),
+                  'refresh': token_meta(replay_refresh),
+              }
+              call('cleanup_otp_replay_session', '/v2/me/logout',
+                   bearer=replay_access, payload={})
+
+          call('control_access0_before_refresh', '/v2/oidc/login', bearer=access0, payload={})
+
+          refresh_status, refresh_raw = call(
+              'control_refresh0_first_use', '/v2/token/refresh',
+              payload={'refresh_token': refresh0}, basic=True,
+          )
+          if refresh_status == 200:
+              access1, refresh1 = tokens(refresh_raw)
+          else:
+              access1, refresh1 = access0, refresh0
+          report['access1'] = token_meta(access1)
+          report['refresh1'] = token_meta(refresh1)
+          report['first_rotation'] = {
+              'access_changed': access1 != access0,
+              'refresh_changed': refresh1 != refresh0,
+          }
+
+          reuse_status, reuse_raw = call(
+              'attack_refresh0_reuse_after_first_refresh', '/v2/token/refresh',
+              payload={'refresh_token': refresh0}, basic=True,
+          )
+          access2, refresh2 = access1, refresh1
+          if reuse_status == 200:
+              access2, refresh2 = tokens(reuse_raw)
+              report['reuse_tokens'] = {
+                  'access': token_meta(access2),
+                  'refresh': token_meta(refresh2),
+                  'access_changed_from_first_refresh': access2 != access1,
+                  'refresh_changed_from_first_refresh': refresh2 != refresh1,
+              }
+
+          call('control_current_access_before_logout', '/v2/oidc/login', bearer=access2, payload={})
+          logout_status, _ = call('control_logout_current_access', '/v2/me/logout',
+                                  bearer=access2, payload={})
+          report['logout_status'] = logout_status
+
+          unique_access: list[tuple[str, str]] = []
+          seen_access: set[str] = set()
+          for label, value in [('access2', access2), ('access1', access1), ('access0', access0)]:
+              digest = hashlib.sha256(value.encode()).hexdigest()
+              if digest not in seen_access:
+                  seen_access.add(digest)
+                  unique_access.append((label, value))
+          for label, value in unique_access:
+              call(f'attack_{label}_after_logout', '/v2/oidc/login', bearer=value, payload={})
+
+          unique_refresh: list[tuple[str, str]] = []
+          seen_refresh: set[str] = set()
+          for label, value in [('refresh2', refresh2), ('refresh1', refresh1), ('refresh0', refresh0)]:
+              digest = hashlib.sha256(value.encode()).hexdigest()
+              if digest not in seen_refresh:
+                  seen_refresh.add(digest)
+                  unique_refresh.append((label, value))
+          for label, value in unique_refresh:
+              status, raw = call(f'attack_{label}_after_logout', '/v2/token/refresh',
+                                 payload={'refresh_token': value}, basic=True)
+              if status == 200:
+                  cleanup_access, cleanup_refresh = tokens(raw)
+                  report.setdefault('post_logout_refresh_successes', []).append({
+                      'source': label,
+                      'access': token_meta(cleanup_access),
+                      'refresh': token_meta(cleanup_refresh),
+                  })
+                  call(f'cleanup_{label}_post_logout_session', '/v2/me/logout',
+                       bearer=cleanup_access, payload={})
+
+          call('negative_repeat_logout', '/v2/me/logout', bearer=access2, payload={})
+
+          report.update({
+              'observations': observations,
+              'minimum_same_host_interval_seconds': 1.0,
+              'real_account_scope': 'one researcher-controlled account',
+              'bookings_accessed': False,
+              'profile_data_stored': False,
+              'raw_tokens_stored': False,
+              'raw_otp_stored': False,
+              'frontend_release': 'v2026-09-01_2',
+              'frontend_commit': '1e07488f21860c5779207fd55e755e8af72044e8',
+          })
+          Path('/tmp/kiwi-evidence/lifecycle.json').write_text(
+              json.dumps(report, indent=2), encoding='utf-8'
+          )
+          PY
+
+          rm -f /tmp/kiwi-auth/private.pem /tmp/kiwi-auth/otp \
+            /tmp/kiwi-auth/transaction_id /tmp/kiwi-auth/challenge
+          sha256sum /tmp/kiwi-evidence/* > /tmp/kiwi-evidence/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kiwi-auth-lifecycle-v2-sanitized
+          path: /tmp/kiwi-evidence
+          retention-days: 1
+          if-no-files-found: warn
