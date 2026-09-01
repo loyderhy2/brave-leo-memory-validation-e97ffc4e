@@ -1,4 +1,4 @@
-name: Kiwi auth v2 callback map
+name: Kiwi auth callback binding map
 
 on:
   push:
@@ -15,16 +15,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Collect bounded v2 and callback evidence
+      - name: Map callback state handling and route bundles
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p evidence/raw evidence/dynamic_chunks
+          mkdir -p evidence/raw evidence/callback_chunks
           python3 <<'PY'
           from __future__ import annotations
 
           import base64
           import hashlib
+          import html
           import json
           import re
           import time
@@ -36,11 +37,12 @@ jobs:
 
           OUT = Path("evidence")
           RAW = OUT / "raw"
-          CHUNKS = OUT / "dynamic_chunks"
+          CHUNKS = OUT / "callback_chunks"
           MIN_HOST_INTERVAL = 1.0
           MAX_BODY = 5 * 1024 * 1024
+          ALLOWED_REDIRECT_HOSTS = {"www.kiwi.com", "kiwi.com"}
           last_request: dict[str, float] = {}
-          log: list[dict[str, Any]] = []
+          request_log: list[dict[str, Any]] = []
 
           class NoRedirect(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -59,24 +61,15 @@ jobs:
           def safe(value: str) -> str:
               return re.sub(r"[^A-Za-z0-9._-]+", "_", value)[:180] or "response"
 
-          def redact_headers(headers: dict[str, str]) -> dict[str, str]:
-              return {
-                  k: ("<redacted-public-client-authorization>" if k.lower() == "authorization" else v)
-                  for k, v in headers.items()
-              }
+          def redact_request_headers(headers: dict[str, str]) -> dict[str, str]:
+              return {k: ("<redacted-public-client-authorization>" if k.lower() == "authorization" else v) for k, v in headers.items()}
 
-          def request(
-              label: str,
-              url: str,
-              method: str = "GET",
-              headers: dict[str, str] | None = None,
-              body: bytes | None = None,
-          ) -> tuple[int, dict[str, str], bytes]:
+          def one_request(label: str, url: str, method: str = "GET", headers: dict[str, str] | None = None, body: bytes | None = None, hop: int = 0) -> tuple[int, dict[str, str], bytes]:
               host = (urllib.parse.urlsplit(url).hostname or "").lower()
               pace(host)
               req_headers = {
                   "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36",
-                  "Accept": "application/json,text/plain,text/html,*/*",
+                  "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*",
                   "Accept-Language": "en-US,en;q=0.8",
                   "Cache-Control": "no-cache",
               }
@@ -99,17 +92,16 @@ jobs:
               if len(response_body) > MAX_BODY:
                   response_body = response_body[:MAX_BODY]
                   response_headers["x-body-truncated"] = "true"
-              stem = f"{safe(label)}__{method.lower()}__{status}"
-              (RAW / f"{stem}.headers.json").write_text(
-                  json.dumps(response_headers, indent=2, sort_keys=True), encoding="utf-8"
-              )
+              stem = f"{safe(label)}__hop{hop}__{method.lower()}__{status}"
+              (RAW / f"{stem}.headers.json").write_text(json.dumps(response_headers, indent=2, sort_keys=True), encoding="utf-8")
               (RAW / f"{stem}.body").write_bytes(response_body)
-              log.append({
+              request_log.append({
                   "label": label,
+                  "hop": hop,
                   "method": method,
                   "url": url,
                   "status": status,
-                  "request_headers": redact_headers(req_headers),
+                  "request_headers": redact_request_headers(req_headers),
                   "request_body_sha256": hashlib.sha256(body or b"").hexdigest(),
                   "response_headers": response_headers,
                   "response_body_bytes": len(response_body),
@@ -117,9 +109,25 @@ jobs:
               })
               return status, response_headers, response_body
 
-          public_basic = "Basic " + base64.b64encode(
-              b"frontend:WoPHu5saC6H8yUU3lnaqPWFbKT"
-          ).decode("ascii")
+          def fetch_chain(label: str, url: str, max_hops: int = 4) -> tuple[str, int, dict[str, str], bytes]:
+              current = url
+              final_status = 0
+              final_headers: dict[str, str] = {}
+              final_body = b""
+              for hop in range(max_hops + 1):
+                  final_status, final_headers, final_body = one_request(label, current, hop=hop)
+                  location = final_headers.get("location")
+                  if final_status not in {301, 302, 303, 307, 308} or not location:
+                      return current, final_status, final_headers, final_body
+                  next_url = urllib.parse.urljoin(current, location)
+                  next_host = (urllib.parse.urlsplit(next_url).hostname or "").lower()
+                  if next_host not in ALLOWED_REDIRECT_HOSTS:
+                      request_log[-1]["redirect_not_followed"] = next_url
+                      return current, final_status, final_headers, final_body
+                  current = next_url
+              return current, final_status, final_headers, final_body
+
+          public_basic = "Basic " + base64.b64encode(b"frontend:WoPHu5saC6H8yUU3lnaqPWFbKT").decode("ascii")
           auth_headers = {
               "Origin": "https://www.kiwi.com",
               "Referer": "https://www.kiwi.com/",
@@ -127,125 +135,112 @@ jobs:
               "Content-Type": "application/json",
           }
 
-          # Current v2 endpoint shape checks. Empty/synthetic inputs only.
-          post_cases = [
-              ("v2_otp_request_empty", "https://auth.skypicker.com/v2/user/otp/request", b"{}", auth_headers),
-              ("v2_otp_login_empty", "https://auth.skypicker.com/v2/user/otp/login", b"{}", auth_headers),
-              ("v2_register_empty", "https://auth.skypicker.com/v2/user/register", b"{}", auth_headers),
-              ("v2_refresh_empty", "https://auth.skypicker.com/v2/token/refresh", b"{}", auth_headers),
-              ("v2_oidc_login_empty", "https://auth.skypicker.com/v2/oidc/login", b"{}", {
-                  "Origin": "https://www.kiwi.com",
-                  "Referer": "https://www.kiwi.com/",
-                  "Authorization": "Bearer synthetic-invalid-token",
-                  "Content-Type": "application/json",
-              }),
-              ("v2_logout_invalid", "https://auth.skypicker.com/v2/me/logout", b"{}", {
-                  "Origin": "https://www.kiwi.com",
-                  "Referer": "https://www.kiwi.com/",
-                  "Authorization": "Bearer synthetic-invalid-token",
-                  "Content-Type": "application/json",
-              }),
-          ]
-          for label, url, body, headers in post_cases:
-              request(label, url, method="POST", headers=headers, body=body)
+          # Generate a fresh legitimate transaction. The provider URL is not followed.
+          init_url = (
+              "https://auth.skypicker.com/v2/oauth/redirect-url"
+              "?provider=google"
+              "&redirect_uri=https://www.kiwi.com/api/user/oauth-handler"
+              "&state_params=binding-control"
+          )
+          init_status, init_headers, init_body = one_request("oauth_init", init_url, method="POST", headers=auth_headers)
+          init_json: dict[str, Any] = {}
+          if init_status == 200:
+              try:
+                  init_json = json.loads(init_body)
+              except Exception:
+                  init_json = {}
+          state_values = init_json.get("query_params", {}).get("state", []) if isinstance(init_json, dict) else []
+          valid_state = state_values[0] if state_values else ""
 
-          # Verify v2 uses the same strict CORS policy.
-          cors_url = "https://auth.skypicker.com/v2/token/refresh"
-          for label, origin in [
-              ("control", "https://www.kiwi.com"),
-              ("attack", "https://attacker.invalid"),
-              ("suffix", "https://www.kiwi.com.attacker.invalid"),
-              ("null", "null"),
-          ]:
-              request(
-                  f"v2_cors_{label}",
-                  cors_url,
-                  method="OPTIONS",
-                  headers={
-                      "Origin": origin,
-                      "Access-Control-Request-Method": "POST",
-                      "Access-Control-Request-Headers": "authorization,content-type",
-                  },
-              )
+          decoded_state = ""
+          if valid_state:
+              try:
+                  decoded_state = base64.b64decode(valid_state).decode("utf-8", errors="replace")
+              except Exception as error:
+                  decoded_state = f"decode-error:{type(error).__name__}"
+          (OUT / "state_metadata.json").write_text(json.dumps({
+              "state_present": bool(valid_state),
+              "state_length": len(valid_state),
+              "decoded_shape": re.sub(r"^[0-9a-fA-F]{16,}:", "<random-transaction-id>:", decoded_state),
+              "init_set_cookie_present": "set-cookie" in init_headers,
+              "provider_url_followed": False,
+          }, indent=2), encoding="utf-8")
 
-          # OAuth redirect construction. The returned provider URL is saved but never followed.
-          oauth_base = "https://auth.skypicker.com/v2/oauth/redirect-url"
-          exact_callback = "https://www.kiwi.com/api/user/oauth-handler"
-          oauth_cases: list[tuple[str, str]] = []
-
-          def oauth_url(provider: str, redirect_uri: str, state_params: str) -> str:
-              return (
-                  f"{oauth_base}?provider={provider}"
-                  f"&redirect_uri={redirect_uri}"
-                  f"&state_params={state_params}"
-              )
-
-          oauth_cases.extend([
-              ("oauth_control_google_empty_state", oauth_url("google", exact_callback, "")),
-              ("oauth_control_google_state", oauth_url("google", exact_callback, "control")),
-              ("oauth_control_apple", oauth_url("apple", exact_callback, "control")),
-              ("oauth_invalid_provider", oauth_url("synthetic-invalid", exact_callback, "control")),
-              ("oauth_redirect_external", oauth_url("google", "https://attacker.invalid/cb", "control")),
-              ("oauth_redirect_scheme_relative", oauth_url("google", "//attacker.invalid/cb", "control")),
-              ("oauth_redirect_userinfo", oauth_url("google", "https://www.kiwi.com@attacker.invalid/cb", "control")),
-              ("oauth_redirect_suffix", oauth_url("google", "https://www.kiwi.com.attacker.invalid/cb", "control")),
-              ("oauth_redirect_trailing_dot", oauth_url("google", "https://www.kiwi.com./api/user/oauth-handler", "control")),
-              ("oauth_redirect_default_port", oauth_url("google", "https://www.kiwi.com:443/api/user/oauth-handler", "control")),
-              ("oauth_redirect_http", oauth_url("google", "http://www.kiwi.com/api/user/oauth-handler", "control")),
-              # Exact frontend behavior: state_params is interpolated without URL encoding.
-              ("oauth_duplicate_redirect_in_state", oauth_url(
-                  "google", exact_callback, "control&redirect_uri=https://attacker.invalid/cb"
-              )),
-              ("oauth_duplicate_provider_in_state", oauth_url(
-                  "google", exact_callback, "control&provider=synthetic-invalid"
-              )),
-              # Encoded delimiter negative control.
-              ("oauth_encoded_delimiter_control", oauth_url(
-                  "google", exact_callback, "control%26redirect_uri%3Dhttps%3A%2F%2Fattacker.invalid%2Fcb"
-              )),
-          ])
-          for label, url in oauth_cases:
-              request(label, url, method="POST", headers=auth_headers)
-
-          # Current first-party callback: synthetic inputs only, redirects not followed.
-          callback_base = "https://www.kiwi.com/api/user/oauth-handler"
+          callback_root = "https://www.kiwi.com/api/user/oauth-handler/"
           callback_cases = [
-              ("callback_empty", callback_base),
-              ("callback_fake_code_state", callback_base + "?code=synthetic-code&state=synthetic-state"),
-              ("callback_error", callback_base + "?error=access_denied&state=synthetic-state"),
-              ("callback_fake_token", callback_base + "?token=synthetic-token&state=synthetic-state"),
-              ("callback_duplicate_state", callback_base + "?code=synthetic-code&state=one&state=two"),
+              ("callback_empty_exact", callback_root),
+              ("callback_random_state", callback_root + "?code=synthetic-code&state=synthetic-random-state"),
+              ("callback_valid_state_fake_code", callback_root + "?code=synthetic-code&state=" + urllib.parse.quote(valid_state, safe="")),
+              ("callback_valid_state_denied", callback_root + "?error=access_denied&state=" + urllib.parse.quote(valid_state, safe="")),
+              ("callback_valid_state_duplicate", callback_root + "?code=synthetic-code&state=" + urllib.parse.quote(valid_state, safe="") + "&state=second"),
           ]
+          callback_html = b""
+          callback_final_url = callback_root
           for label, url in callback_cases:
-              request(label, url)
+              final_url, status, headers, body = fetch_chain(label, url)
+              if label == "callback_empty_exact":
+                  callback_html = body
+                  callback_final_url = final_url
 
-          # Fetch the only multi-chunk lazy group referenced by the current login shell, serially.
-          dpl = "?dpl=v2026-09-01_2"
-          dynamic_names = [
-              "436fx3-u9mhhz.js",
-              "1jdind09vy_86.js",
-              "1wugkj4agkzw3.js",
-              "01iybabjbr3ki.js",
-              "37hhlzjwlonw7.js",
-              "1s49scfue95j2.js",
-              "0xn-11g8g1wgm.js",
-              "0-9_hbkf1xdc0.js",
-          ]
+          # Apple uses response_mode=form_post. Use synthetic values only.
+          form_body = urllib.parse.urlencode({
+              "code": "synthetic-code",
+              "state": valid_state,
+              "user": "{}",
+          }).encode("ascii")
+          one_request(
+              "callback_form_post_valid_state_fake_code",
+              callback_root,
+              method="POST",
+              headers={
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "Origin": "https://appleid.apple.com",
+                  "Referer": "https://appleid.apple.com/",
+              },
+              body=form_body,
+          )
+
+          # Extract callback-specific chunks from the exact route page and fetch serially.
+          callback_text = callback_html.decode("utf-8", errors="replace")
+          script_candidates: list[str] = []
+          for pattern in [
+              r'''<script[^>]+src=["']([^"']+\.js(?:\?[^"']*)?)["']''',
+              r'''(https://static\.kiwi\.com/[^"'<>\\s]+\.js(?:\?[^"'<>\\s]*)?)''',
+          ]:
+              for match in re.finditer(pattern, callback_text, flags=re.IGNORECASE):
+                  script_candidates.append(html.unescape(urllib.parse.urljoin(callback_final_url, match.group(1))))
+
+          seen: set[str] = set()
+          script_urls: list[str] = []
+          for url in script_candidates:
+              parsed = urllib.parse.urlsplit(url)
+              if parsed.scheme != "https" or (parsed.hostname or "").lower() not in {"www.kiwi.com", "static.kiwi.com"}:
+                  continue
+              if url in seen:
+                  continue
+              seen.add(url)
+              script_urls.append(url)
+              if len(script_urls) >= 45:
+                  break
+
           chunk_index: list[dict[str, Any]] = []
-          auth_hits: list[dict[str, Any]] = []
+          hits: list[dict[str, Any]] = []
           terms = [
-              "handleSocialLogin", "state_params", "oauth-handler", "v2/oauth/redirect-url",
-              "userOTPRequest", "userOTPLogin", "userRegister", "redirect_uri", "provider",
-              "google", "apple", "facebook", "su_access_token", "su_refresh_token",
+              "oidcAuthorize", "handleSocialLogin", "v2/oidc/login", "oauth-handler",
+              "state", "nonce", "code_verifier", "code_challenge", "provider",
+              "postLoginRedirectPath", "state_params", "onLogIn", "su_access_token",
+              "su_refresh_token", "ua_session_token", "OAUTH_INVALID_PARAMETERS",
+              "OAUTH_INVALID_PROVIDER", "OAUTH_SUCCESSFUL_LOGIN",
           ]
-          for name in dynamic_names:
-              url = "https://www.kiwi.com/_next/static/chunks/" + name + dpl
-              status, headers, body = request("dynamic_" + name, url)
-              (CHUNKS / name).write_bytes(body)
+          for index, url in enumerate(script_urls):
+              status, headers, body = one_request(f"callback_chunk_{index:02d}", url)
+              filename = f"{index:02d}_{safe(Path(urllib.parse.urlsplit(url).path).name)}"
+              (CHUNKS / filename).write_bytes(body)
               text = body.decode("utf-8", errors="replace")
               chunk_index.append({
-                  "name": name,
+                  "index": index,
                   "url": url,
+                  "filename": filename,
                   "status": status,
                   "bytes": len(body),
                   "sha256": hashlib.sha256(body).hexdigest(),
@@ -253,30 +248,31 @@ jobs:
               })
               for term in terms:
                   start = 0
-                  for _ in range(30):
+                  for _ in range(40):
                       pos = text.lower().find(term.lower(), start)
                       if pos < 0:
                           break
-                      auth_hits.append({
-                          "source": name,
+                      hits.append({
+                          "source": filename,
                           "term": term,
                           "offset": pos,
-                          "snippet": text[max(0, pos - 600):min(len(text), pos + len(term) + 1600)],
+                          "snippet": text[max(0, pos - 700):min(len(text), pos + len(term) + 2200)],
                       })
                       start = pos + len(term)
 
-          (OUT / "request_log.json").write_text(json.dumps(log, indent=2, ensure_ascii=False), encoding="utf-8")
-          (OUT / "dynamic_chunk_index.json").write_text(json.dumps(chunk_index, indent=2), encoding="utf-8")
-          (OUT / "dynamic_auth_hits.json").write_text(json.dumps(auth_hits, indent=2, ensure_ascii=False), encoding="utf-8")
+          (OUT / "callback_script_index.json").write_text(json.dumps(chunk_index, indent=2), encoding="utf-8")
+          (OUT / "callback_auth_hits.json").write_text(json.dumps(hits, indent=2, ensure_ascii=False), encoding="utf-8")
+          (OUT / "request_log.json").write_text(json.dumps(request_log, indent=2, ensure_ascii=False), encoding="utf-8")
           (OUT / "run_metadata.json").write_text(json.dumps({
               "generated_at_utc": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
               "minimum_same_host_interval_seconds": MIN_HOST_INTERVAL,
               "credentials_used": False,
               "public_frontend_client_only": True,
               "real_email_used": False,
-              "real_oauth_provider_navigation": False,
+              "real_provider_authorization": False,
+              "provider_url_followed": False,
               "destructive_requests": False,
-              "production_request_count": len(log),
+              "production_request_count": len(request_log),
               "release": "v2026-09-01_2",
               "frontend_commit": "1e07488f21860c5779207fd55e755e8af72044e8",
           }, indent=2), encoding="utf-8")
@@ -287,7 +283,7 @@ jobs:
       - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: kiwi-auth-v2-callback-map
+          name: kiwi-auth-callback-binding-map
           path: evidence
           if-no-files-found: error
           retention-days: 7
