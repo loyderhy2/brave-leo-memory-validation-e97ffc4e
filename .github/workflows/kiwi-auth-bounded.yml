@@ -1,0 +1,285 @@
+name: Kiwi auth bounded research
+
+on:
+  push:
+    branches:
+      - kiwi-auth-research-20260901
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect bounded public auth evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+          from typing import Any
+
+          OUT = Path("evidence")
+          RAW = OUT / "raw"
+          BUNDLES = OUT / "bundles"
+          RAW.mkdir(parents=True, exist_ok=True)
+          BUNDLES.mkdir(parents=True, exist_ok=True)
+
+          MIN_HOST_INTERVAL = 1.0
+          MAX_BODY = 5 * 1024 * 1024
+          ALLOWED_REDIRECT_HOSTS = {"www.kiwi.com", "kiwi.com", "auth.skypicker.com"}
+          last_request: dict[str, float] = {}
+          request_log: list[dict[str, Any]] = []
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          opener = urllib.request.build_opener(NoRedirect)
+
+          def pace(host: str) -> None:
+              previous = last_request.get(host)
+              if previous is not None:
+                  remaining = MIN_HOST_INTERVAL - (time.monotonic() - previous)
+                  if remaining > 0:
+                      time.sleep(remaining)
+              last_request[host] = time.monotonic()
+
+          def safe_name(value: str) -> str:
+              value = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+              return value[:180] or "response"
+
+          def one_request(url: str, method: str = "GET", headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], bytes]:
+              parsed = urllib.parse.urlsplit(url)
+              host = (parsed.hostname or "").lower()
+              pace(host)
+              merged = {
+                  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36",
+                  "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+                  "Accept-Language": "en-US,en;q=0.8",
+                  "Cache-Control": "no-cache",
+              }
+              if headers:
+                  merged.update(headers)
+              req = urllib.request.Request(url, headers=merged, method=method)
+              try:
+                  with opener.open(req, timeout=30) as response:
+                      status = int(response.status)
+                      response_headers = {k.lower(): v for k, v in response.headers.items()}
+                      body = response.read(MAX_BODY + 1)
+              except urllib.error.HTTPError as error:
+                  status = int(error.code)
+                  response_headers = {k.lower(): v for k, v in error.headers.items()}
+                  body = error.read(MAX_BODY + 1)
+              except Exception as error:
+                  return 0, {"x-client-error": f"{type(error).__name__}: {error}"}, b""
+              if len(body) > MAX_BODY:
+                  body = body[:MAX_BODY]
+                  response_headers["x-body-truncated"] = "true"
+              return status, response_headers, body
+
+          def fetch_chain(label: str, url: str, method: str = "GET", headers: dict[str, str] | None = None, max_redirects: int = 5) -> tuple[str, bytes, dict[str, str]]:
+              current = url
+              final_body = b""
+              final_headers: dict[str, str] = {}
+              for hop in range(max_redirects + 1):
+                  status, response_headers, body = one_request(current, method=method, headers=headers)
+                  digest = hashlib.sha256(body).hexdigest()
+                  suffix = f"{safe_name(label)}__hop{hop}__{status}"
+                  (RAW / f"{suffix}.headers.json").write_text(json.dumps(response_headers, indent=2, sort_keys=True), encoding="utf-8")
+                  (RAW / f"{suffix}.body").write_bytes(body)
+                  entry = {
+                      "label": label,
+                      "hop": hop,
+                      "method": method,
+                      "url": current,
+                      "status": status,
+                      "headers": response_headers,
+                      "body_bytes": len(body),
+                      "body_sha256": digest,
+                  }
+                  request_log.append(entry)
+                  final_body, final_headers = body, response_headers
+                  location = response_headers.get("location")
+                  if method != "GET" or status not in {301, 302, 303, 307, 308} or not location:
+                      return current, final_body, final_headers
+                  next_url = urllib.parse.urljoin(current, location)
+                  next_host = (urllib.parse.urlsplit(next_url).hostname or "").lower()
+                  if next_host not in ALLOWED_REDIRECT_HOSTS:
+                      entry["redirect_not_followed"] = next_url
+                      return current, final_body, final_headers
+                  current = next_url
+              return current, final_body, final_headers
+
+          targets = [
+              ("www_login", "https://www.kiwi.com/en/user/login/"),
+              ("auth_root", "https://auth.skypicker.com/"),
+              ("auth_robots", "https://auth.skypicker.com/robots.txt"),
+              ("legacy_user_exists_get", "https://auth.skypicker.com/v1/user.exists"),
+              ("legacy_otp_login_get", "https://auth.skypicker.com/v1/user.otpLogin"),
+              ("legacy_user_login_get", "https://auth.skypicker.com/v1/user.login"),
+              ("legacy_user_get", "https://auth.skypicker.com/v1/user.get"),
+              ("legacy_google_callback", "https://auth.skypicker.com/v1/oauth.google.authorized"),
+          ]
+
+          login_final = "https://www.kiwi.com/en/user/login/"
+          login_body = b""
+          for label, url in targets:
+              final_url, body, _ = fetch_chain(label, url)
+              if label == "www_login":
+                  login_final, login_body = final_url, body
+
+          cors_endpoints = [
+              "https://auth.skypicker.com/v1/user.exists",
+              "https://auth.skypicker.com/v1/user.otpLogin",
+              "https://auth.skypicker.com/v1/user.login",
+              "https://auth.skypicker.com/v1/user.get",
+          ]
+          origins = [
+              ("control", "https://www.kiwi.com"),
+              ("attack", "https://attacker.invalid"),
+          ]
+          for endpoint in cors_endpoints:
+              endpoint_label = safe_name(urllib.parse.urlsplit(endpoint).path.strip("/"))
+              for origin_label, origin in origins:
+                  fetch_chain(
+                      f"cors_{endpoint_label}_{origin_label}",
+                      endpoint,
+                      method="OPTIONS",
+                      headers={
+                          "Origin": origin,
+                          "Access-Control-Request-Method": "POST",
+                          "Access-Control-Request-Headers": "authorization,content-type",
+                      },
+                      max_redirects=0,
+                  )
+
+          html = login_body.decode("utf-8", errors="replace")
+          (OUT / "login_final_url.txt").write_text(login_final + "\n", encoding="utf-8")
+          (OUT / "login_document_sha256.txt").write_text(hashlib.sha256(login_body).hexdigest() + "\n", encoding="utf-8")
+
+          candidates: list[str] = []
+          regexes = [
+              r'''(?:src|href)=["']([^"']+\.js(?:\?[^"']*)?)["']''',
+              r'''(https?://[^"'<>\s]+\.js(?:\?[^"'<>\s]*)?)''',
+              r'''(/(?:_next|static|assets)/[^"'<>\s]+\.js(?:\?[^"'<>\s]*)?)''',
+          ]
+          for pattern in regexes:
+              for match in re.finditer(pattern, html, flags=re.IGNORECASE):
+                  candidates.append(urllib.parse.urljoin(login_final, match.group(1)))
+
+          bundle_urls: list[str] = []
+          seen: set[str] = set()
+          for url in candidates:
+              parsed = urllib.parse.urlsplit(url)
+              if parsed.scheme != "https" or (parsed.hostname or "").lower() != "www.kiwi.com":
+                  continue
+              if url in seen:
+                  continue
+              seen.add(url)
+              bundle_urls.append(url)
+              if len(bundle_urls) >= 30:
+                  break
+
+          bundle_index: list[dict[str, Any]] = []
+          bundle_texts: list[tuple[str, str]] = []
+          for index, url in enumerate(bundle_urls):
+              _, body, headers = fetch_chain(f"bundle_{index:02d}", url, max_redirects=2)
+              path_name = Path(urllib.parse.urlsplit(url).path).name or f"bundle_{index}.js"
+              filename = f"{index:02d}_{safe_name(path_name)}"
+              (BUNDLES / filename).write_bytes(body)
+              text = body.decode("utf-8", errors="replace")
+              bundle_texts.append((url, text))
+              bundle_index.append({
+                  "index": index,
+                  "url": url,
+                  "filename": filename,
+                  "bytes": len(body),
+                  "sha256": hashlib.sha256(body).hexdigest(),
+                  "content_type": headers.get("content-type"),
+              })
+
+          patterns = [
+              r"auth\.skypicker\.com",
+              r"/v\d+/[A-Za-z0-9._/-]+",
+              r"user\.(?:exists|otpLogin|login|get|logout|refresh|revoke)",
+              r"oauth\.[A-Za-z0-9._/-]+",
+              r"ua_session_token",
+              r"su_access_token",
+              r"su_refresh_token",
+              r"simpleToken",
+              r"transaction_id",
+              r"redirect_uri",
+              r"returnUrl|return_url",
+              r"code_challenge|code_verifier",
+              r"\bstate\b",
+              r"\bnonce\b",
+              r"logout|signout|revoke|refresh",
+          ]
+          hits: list[dict[str, Any]] = []
+          search_corpus = [("login_html", html)] + bundle_texts
+          for source, text in search_corpus:
+              for pattern in patterns:
+                  count = 0
+                  for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                      start = max(0, match.start() - 260)
+                      end = min(len(text), match.end() + 260)
+                      snippet = text[start:end].replace("\x00", "")
+                      hits.append({"source": source, "pattern": pattern, "match": match.group(0), "snippet": snippet})
+                      count += 1
+                      if count >= 20 or len(hits) >= 1500:
+                          break
+                  if len(hits) >= 1500:
+                      break
+              if len(hits) >= 1500:
+                  break
+
+          exposed_urls: set[str] = set()
+          endpoint_strings: set[str] = set()
+          for _, text in search_corpus:
+              for match in re.finditer(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", text):
+                  value = match.group(0).rstrip(".,;)'\"")
+                  if any(term in value.lower() for term in ("auth", "oauth", "login", "session", "token", "kiwi.com", "skypicker.com")):
+                      exposed_urls.add(value[:1000])
+              for match in re.finditer(r"/(?:v\d+|api|oauth|user|auth)/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", text):
+                  endpoint_strings.add(match.group(0)[:1000])
+
+          (OUT / "bundle_index.json").write_text(json.dumps(bundle_index, indent=2, sort_keys=True), encoding="utf-8")
+          (OUT / "interesting_hits.json").write_text(json.dumps(hits, indent=2, ensure_ascii=False), encoding="utf-8")
+          (OUT / "exposed_urls.json").write_text(json.dumps(sorted(exposed_urls), indent=2), encoding="utf-8")
+          (OUT / "endpoint_strings.json").write_text(json.dumps(sorted(endpoint_strings), indent=2), encoding="utf-8")
+          (OUT / "request_log.json").write_text(json.dumps(request_log, indent=2, ensure_ascii=False), encoding="utf-8")
+          (OUT / "run_metadata.json").write_text(json.dumps({
+              "generated_at_utc": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+              "minimum_same_host_interval_seconds": MIN_HOST_INTERVAL,
+              "credentials_used": False,
+              "destructive_requests": False,
+              "bundle_limit": 30,
+              "production_request_count": len(request_log),
+          }, indent=2), encoding="utf-8")
+          PY
+
+          find evidence -type f -print0 | sort -z | xargs -0 sha256sum > evidence/SHA256SUMS.txt
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiwi-auth-bounded-evidence
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
