@@ -50,37 +50,60 @@ jobs:
 
       - name: Receive, authenticate, and execute encrypted local job
         id: execute
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           umask 077
 
           body=''
-          for _ in $(seq 1 300); do
+          for _ in $(seq 1 240); do
+            set +e
             body=$(gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" \
-              --json body --jq '.body')
-            if grep -q '^A20_ENCRYPTED_JOB_V1$' <<<"$body"; then
+              --json body --jq '.body' 2>/tmp/a20-channel/poll-error.txt)
+            poll_rc=$?
+            set -e
+            if [[ "$poll_rc" -eq 0 ]] && grep -q '^A20_ENCRYPTED_JOB_V1$' <<<"$body"; then
               break
             fi
-            sleep 3
+            sleep 10
           done
 
           if ! grep -q '^A20_ENCRYPTED_JOB_V1$' <<<"$body"; then
-            echo 'Encrypted job payload was not received' > /tmp/a20-evidence/runner-error.txt
+            echo 'Encrypted job payload was not received before the bounded deadline' \
+              > /tmp/a20-evidence/runner-error.txt
+            [[ -f /tmp/a20-channel/poll-error.txt ]] && \
+              cp /tmp/a20-channel/poll-error.txt /tmp/a20-evidence/poll-error.txt
             echo 'exit_code=90' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          reply_key_b64=$(sed -n 's/^reply_key=//p' <<<"$body" | head -1)
           key_b64=$(sed -n 's/^key=//p' <<<"$body" | head -1)
           payload_b64=$(sed -n 's/^payload=//p' <<<"$body" | head -1)
-          if [[ -z "$key_b64" || -z "$payload_b64" ]]; then
+          if [[ -z "$reply_key_b64" || -z "$key_b64" || -z "$payload_b64" ]]; then
             echo 'Encrypted job body was malformed' > /tmp/a20-evidence/runner-error.txt
             echo 'exit_code=91' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          printf '%s' "$key_b64" | base64 -d > /tmp/a20-channel/key.bin
-          printf '%s' "$payload_b64" | base64 -d > /tmp/a20-channel/payload.enc
+          if ! printf '%s' "$reply_key_b64" | base64 -d \
+            > /tmp/a20-job/evidence-public.pem; then
+            echo 'Requester evidence public key was malformed' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=97' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! printf '%s' "$key_b64" | base64 -d > /tmp/a20-channel/key.bin; then
+            echo 'Encrypted metadata was not valid base64' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=98' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! printf '%s' "$payload_b64" | base64 -d > /tmp/a20-channel/payload.enc; then
+            echo 'Encrypted payload was not valid base64' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=99' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if ! openssl pkeyutl -decrypt \
             -inkey /tmp/a20-channel/job-private.pem \
@@ -125,13 +148,21 @@ jobs:
             exit 0
           fi
 
-          tar -xzf /tmp/a20-channel/payload.tar.gz -C /tmp/a20-job
-          test -f /tmp/a20-job/run.sh
-          test -f /tmp/a20-job/evidence-public.pem
+          if ! tar -xzf /tmp/a20-channel/payload.tar.gz -C /tmp/a20-job; then
+            echo 'Decrypted job archive could not be extracted' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=100' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! -f /tmp/a20-job/run.sh ]]; then
+            echo 'Decrypted job archive did not contain run.sh' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=101' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           chmod 700 /tmp/a20-job/run.sh
 
           gh issue edit "$ISSUE_NUMBER" --repo "$REPOSITORY" \
-            --body 'Encrypted owner-authorized local integration payload consumed and redacted.' >/dev/null
+            --body 'Encrypted owner-authorized local integration payload consumed and redacted.' \
+            >/dev/null 2>&1 || true
 
           rm -f /tmp/a20-channel/key.bin /tmp/a20-channel/key.txt \
             /tmp/a20-channel/payload.enc /tmp/a20-channel/payload.tar.gz \
@@ -152,7 +183,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          mkdir -p /tmp/a20-result
+          mkdir -p /tmp/a20-result /tmp/a20-evidence
 
           if [[ ! -f /tmp/a20-job/evidence-public.pem ]]; then
             echo 'Requester evidence public key was unavailable.' > /tmp/a20-evidence/packaging-error.txt
@@ -211,10 +242,10 @@ jobs:
           set -euo pipefail
           if [[ -f /tmp/a20-result/manifest.txt ]]; then
             gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" \
-              --body-file /tmp/a20-result/manifest.txt >/dev/null
+              --body-file /tmp/a20-result/manifest.txt >/dev/null 2>&1 || true
           else
             gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" \
-              --body 'A20_ENCRYPTED_EVIDENCE_V1 packaging_failed' >/dev/null
+              --body 'A20_ENCRYPTED_EVIDENCE_V1 packaging_failed' >/dev/null 2>&1 || true
           fi
 
       - name: Preserve job conclusion
@@ -222,5 +253,5 @@ jobs:
         shell: bash
         run: |
           rc='${{ steps.execute.outputs.exit_code }}'
-          [[ -n "$rc" ]] || rc=99
+          [[ -n "$rc" ]] || rc=102
           exit "$rc"
