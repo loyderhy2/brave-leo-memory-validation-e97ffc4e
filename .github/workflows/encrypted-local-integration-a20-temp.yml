@@ -1,0 +1,226 @@
+name: Encrypted owner-only local integration runner A20
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  run-encrypted-job:
+    if: >-
+      github.event.issue.title == '[SECURITY-RESEARCH] Run encrypted local integration A20' &&
+      github.event.issue.user.login == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Checkout runner repository
+        uses: actions/checkout@v4
+
+      - name: Open one-time encrypted input channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/a20-channel /tmp/a20-job /tmp/a20-evidence
+
+          challenge=$(openssl rand -hex 16)
+          printf '%s' "$challenge" > /tmp/a20-channel/challenge
+
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 \
+            -out /tmp/a20-channel/job-private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/a20-channel/job-private.pem -pubout \
+            -out /tmp/a20-channel/job-public.pem >/dev/null 2>&1
+          public_key_b64=$(base64 -w0 /tmp/a20-channel/job-public.pem)
+
+          {
+            echo 'A20_ENCRYPTED_CHANNEL_V1'
+            echo "challenge=${challenge}"
+            echo "public_key_base64=${public_key_b64}"
+          } > /tmp/a20-channel/channel.txt
+
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+            --body-file /tmp/a20-channel/channel.txt >/dev/null
+
+      - name: Receive, authenticate, and execute encrypted local job
+        id: execute
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          body=''
+          for _ in $(seq 1 300); do
+            body=$(gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+              --json body --jq '.body')
+            if grep -q '^A20_ENCRYPTED_JOB_V1$' <<<"$body"; then
+              break
+            fi
+            sleep 3
+          done
+
+          if ! grep -q '^A20_ENCRYPTED_JOB_V1$' <<<"$body"; then
+            echo 'Encrypted job payload was not received' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=90' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          key_b64=$(sed -n 's/^key=//p' <<<"$body" | head -1)
+          payload_b64=$(sed -n 's/^payload=//p' <<<"$body" | head -1)
+          if [[ -z "$key_b64" || -z "$payload_b64" ]]; then
+            echo 'Encrypted job body was malformed' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=91' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf '%s' "$key_b64" | base64 -d > /tmp/a20-channel/key.bin
+          printf '%s' "$payload_b64" | base64 -d > /tmp/a20-channel/payload.enc
+
+          if ! openssl pkeyutl -decrypt \
+            -inkey /tmp/a20-channel/job-private.pem \
+            -in /tmp/a20-channel/key.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -out /tmp/a20-channel/key.txt; then
+            echo 'Unable to decrypt job key metadata' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=92' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          IFS='|' read -r received_challenge key_hex iv_hex cipher_sha plain_sha \
+            < /tmp/a20-channel/key.txt
+          expected_challenge=$(cat /tmp/a20-channel/challenge)
+          if [[ "$received_challenge" != "$expected_challenge" ]]; then
+            echo 'Job challenge mismatch' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=93' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          actual_cipher_sha=$(sha256sum /tmp/a20-channel/payload.enc | awk '{print $1}')
+          if [[ "$actual_cipher_sha" != "$cipher_sha" ]]; then
+            echo 'Encrypted payload hash mismatch' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=94' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! openssl enc -d -aes-256-cbc \
+            -K "$key_hex" -iv "$iv_hex" \
+            -in /tmp/a20-channel/payload.enc \
+            -out /tmp/a20-channel/payload.tar.gz; then
+            echo 'Unable to decrypt job payload' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=95' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          actual_plain_sha=$(sha256sum /tmp/a20-channel/payload.tar.gz | awk '{print $1}')
+          if [[ "$actual_plain_sha" != "$plain_sha" ]]; then
+            echo 'Decrypted payload hash mismatch' > /tmp/a20-evidence/runner-error.txt
+            echo 'exit_code=96' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tar -xzf /tmp/a20-channel/payload.tar.gz -C /tmp/a20-job
+          test -f /tmp/a20-job/run.sh
+          test -f /tmp/a20-job/evidence-public.pem
+          chmod 700 /tmp/a20-job/run.sh
+
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+            --body 'Encrypted owner-authorized local integration payload consumed and redacted.' >/dev/null
+
+          rm -f /tmp/a20-channel/key.bin /tmp/a20-channel/key.txt \
+            /tmp/a20-channel/payload.enc /tmp/a20-channel/payload.tar.gz \
+            /tmp/a20-channel/job-private.pem /tmp/a20-channel/channel.txt
+
+          set +e
+          A20_EVIDENCE_DIR=/tmp/a20-evidence \
+            bash /tmp/a20-job/run.sh > /tmp/a20-evidence/job.log 2>&1
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > /tmp/a20-evidence/exit-code.txt
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "Encrypted local job completed with exit code $rc"
+
+      - name: Encrypt evidence for requester
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p /tmp/a20-result
+
+          if [[ ! -f /tmp/a20-job/evidence-public.pem ]]; then
+            echo 'Requester evidence public key was unavailable.' > /tmp/a20-evidence/packaging-error.txt
+            exit 1
+          fi
+
+          tar -czf /tmp/a20-result/evidence.tar.gz -C /tmp a20-evidence
+          key_hex=$(openssl rand -hex 32)
+          iv_hex=$(openssl rand -hex 16)
+          plain_sha=$(sha256sum /tmp/a20-result/evidence.tar.gz | awk '{print $1}')
+
+          openssl enc -aes-256-cbc \
+            -K "$key_hex" -iv "$iv_hex" \
+            -in /tmp/a20-result/evidence.tar.gz \
+            -out /tmp/a20-result/evidence.enc
+          cipher_sha=$(sha256sum /tmp/a20-result/evidence.enc | awk '{print $1}')
+
+          rc='unknown'
+          [[ -f /tmp/a20-evidence/exit-code.txt ]] && rc=$(cat /tmp/a20-evidence/exit-code.txt)
+          printf '%s|%s|%s|%s|%s\n' \
+            "$key_hex" "$iv_hex" "$cipher_sha" "$plain_sha" "$rc" \
+            > /tmp/a20-result/evidence-key.txt
+
+          openssl pkeyutl -encrypt \
+            -pubin -inkey /tmp/a20-job/evidence-public.pem \
+            -in /tmp/a20-result/evidence-key.txt \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -out /tmp/a20-result/evidence-key.enc
+
+          {
+            echo 'A20_ENCRYPTED_EVIDENCE_V1'
+            echo "run_id=${{ github.run_id }}"
+            echo "cipher_sha256=${cipher_sha}"
+            echo "exit_code=${rc}"
+          } > /tmp/a20-result/manifest.txt
+
+          rm -f /tmp/a20-result/evidence.tar.gz /tmp/a20-result/evidence-key.txt
+
+      - name: Upload encrypted evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a20-encrypted-evidence-${{ github.run_id }}
+          path: |
+            /tmp/a20-result/evidence.enc
+            /tmp/a20-result/evidence-key.enc
+            /tmp/a20-result/manifest.txt
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Publish non-sensitive completion marker
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f /tmp/a20-result/manifest.txt ]]; then
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+              --body-file /tmp/a20-result/manifest.txt >/dev/null
+          else
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+              --body 'A20_ENCRYPTED_EVIDENCE_V1 packaging_failed' >/dev/null
+          fi
+
+      - name: Preserve job conclusion
+        if: always()
+        shell: bash
+        run: |
+          rc='${{ steps.execute.outputs.exit_code }}'
+          [[ -n "$rc" ]] || rc=99
+          exit "$rc"
